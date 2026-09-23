@@ -207,6 +207,27 @@ class StitcherTest(unittest.TestCase):
         self.assertEqual(result.committed, [])
         self.assertEqual(stitcher.committed_until, 3.0)
 
+    def test_repeated_text_at_a_different_time_is_committed(self):
+        # 去重靠时间水位线，**绝不比对文字**。同一句话在不同时刻说出来是正常的——
+        # "嗯"、"对"、"是的" 这类会反复出现——按文字去重会把这些静默丢掉。
+        stitcher = Stitcher(window=20.0, tail=6.0)
+        first = stitcher.ingest(
+            window_start=0.0, window_end=20.0,
+            raw_text=_rawl((1.0, 3.0, "S01", "嗯")), window_id=0,
+        )
+        self.assertEqual([s.text for s in first.committed], ["嗯"])
+        self.assertEqual(stitcher.committed_until, 3.0)
+
+        # 第二段在窗口 [5, 25] 内的 6.0-8.0 秒处，换算成绝对时间 11.0-13.0，
+        # 严格位于水位线 3.0 之后，所以必须定稿——尽管文字与上一段完全相同。
+        second = stitcher.ingest(
+            window_start=5.0, window_end=25.0,
+            raw_text=_rawl((6.0, 8.0, "S01", "嗯")), window_id=1,
+        )
+
+        self.assertEqual([s.text for s in second.committed], ["嗯"])
+        self.assertEqual(stitcher.committed_until, 13.0)
+
     def test_segment_straddling_the_watermark_is_dropped(self):
         stitcher = Stitcher(window=20.0, tail=6.0)
         stitcher.ingest(
