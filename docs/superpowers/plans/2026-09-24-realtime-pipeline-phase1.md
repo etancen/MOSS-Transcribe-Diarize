@@ -315,7 +315,11 @@ class RealtimeConfigTest(unittest.TestCase):
         self.assertEqual(RealtimeConfig(window=40.0).effective_max_new_tokens(), 2040)
 
     def test_effective_max_new_tokens_has_a_floor(self):
-        self.assertEqual(RealtimeConfig(window=1.0).effective_max_new_tokens(), 256)
+        # window=1.0 必须同时给出 hop 与 tail：默认 hop=5.0 会让 __post_init__
+        # 先以 hop > window 拒绝这个配置，断言根本执行不到。
+        config = RealtimeConfig(window=1.0, hop=1.0, tail=0.0)
+
+        self.assertEqual(config.effective_max_new_tokens(), 256)
 
     def test_explicit_max_new_tokens_wins(self):
         config = RealtimeConfig(window=20.0, max_new_tokens=77)
