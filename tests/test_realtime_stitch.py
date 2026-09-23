@@ -37,15 +37,31 @@ class ParseWindowSegmentsTest(unittest.TestCase):
 
         self.assertEqual([s.text for s in segments], ["有效", "也好"])
 
-    def test_unseparated_noise_pollutes_a_segment_and_is_dropped(self):
-        # 没有空白分隔时解析器会把 [1.5] 折回正文，再把 [2.0] 当成该段的结束时间，
-        # 于是本段文字含方括号、结束时间被顶到下一段起点，而 [S02] 解析失败被丢弃。
-        # 污染段整段丢弃，所以这里期望空——宁可丢，也不把污染的文字写进定稿。
+    def test_unseparated_noise_pollutes_a_segment_and_we_pass_it_through(self):
+        # 没有空白分隔时，解析器把 [1.5] 折回正文，再把 [2.0] 当成该段的结束时间
+        # （2.0 >= 0.5 故 _read_end 接受），于是本段变成
+        # (0.5, 2.0, "S01", "有效[1.5]垃圾")——文字与结束时间双双被污染；而 [S02] 在
+        # _READ_START 状态解析失败被 reset，"也好" 随之静默消失。
+        #
+        # 本模块原样透传，不做修补：解析器无法区分这种污染与它刻意保留的正文方括号
+        # （见下面那条用例），任何"含括号就丢弃"的判据都会误伤合法内容。这段音频会由
+        # 下一个窗口重新覆盖，所以是暂时性丢失。
         raw = "[0.5][S01]有效[1.5]垃圾[2.0][S02]也好[3.0]"
 
         segments = parse_window_segments(raw, window_start=0.0, window_id=0)
 
-        self.assertEqual(segments, [])
+        self.assertEqual([s.text for s in segments], ["有效[1.5]垃圾"])
+        self.assertEqual(segments[0].end, 2.0)
+
+    def test_brackets_inside_speech_are_preserved(self):
+        # transcript_parser 有明确的契约（见 tests/test_transcript_parser.py 的
+        # test_numeric_brackets_inside_text_are_preserved）：正文里的方括号是被刻意
+        # 保留的，不是污染。任何"正文含方括号就丢弃"的判据都会误伤这条，所以这里钉住它。
+        raw = "[0][S01]第[2024]年，编号[001]继续[4]"
+
+        segments = parse_window_segments(raw, window_start=0.0, window_id=0)
+
+        self.assertEqual([s.text for s in segments], ["第[2024]年，编号[001]继续"])
 
     def test_trailing_prose_after_the_last_segment_drops_that_segment(self):
         # 流尾的杂散文本（_after_end 的第 1 种例外）：[end] 之后遇到非空白字符会把
