@@ -498,5 +498,83 @@ class RealtimeSessionTest(unittest.TestCase):
         self.assertEqual(session._buffer.total_seconds, 0.0)
 
 
+class SilenceGateTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.runs = Path(self._tmp.name) / "runs"
+
+    def _session(self, transcriber, **kwargs) -> RealtimeSession:
+        # 注意不要把 silence_gate 同时写死再通过 **kwargs 传一次——那会是重复关键字。
+        params = {"silence_gate": True}
+        params.update(kwargs)
+        return RealtimeSession(
+            _config(**params),
+            transcriber=transcriber,
+            store=SessionStore(self.runs, "s1"),
+        )
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def test_silent_window_skips_inference(self):
+        transcriber = ScriptedTranscriber(["[1][S01]a[2]"] * 3)
+        session = self._session(transcriber)
+        session.push_audio(_silence(10.0))
+
+        events = self._run(session.run_pending())
+
+        self.assertEqual(transcriber.window_seconds, [])
+        status = next(event for event in events if event["type"] == "status")
+        self.assertEqual(status["state"], "running")
+
+    def test_silent_window_still_advances_the_schedule(self):
+        """跳过后必须推进 last_run_sec，否则每次轮询都在重算同一个窗口。"""
+        transcriber = ScriptedTranscriber(["[1][S01]a[2]"] * 3)
+        session = self._session(transcriber)
+        session.push_audio(_silence(10.0))
+        self._run(session.run_pending())
+
+        session.push_audio(_silence(2.0))
+        events = self._run(session.run_pending())
+
+        self.assertEqual(events, [])
+        self.assertEqual(transcriber.window_seconds, [])
+
+    def test_speech_after_silence_is_transcribed(self):
+        transcriber = ScriptedTranscriber(["[1][S01]恢复[2]"] * 3)
+        session = self._session(transcriber)
+        session.push_audio(_silence(10.0))
+        self._run(session.run_pending())
+
+        session.push_audio(_speech(10.0))
+        events = self._run(session.run_pending())
+
+        self.assertEqual(len(transcriber.window_seconds), 1)
+        self.assertIn("committed", [event["type"] for event in events])
+
+    def test_close_runs_even_when_the_final_window_is_silent(self):
+        """关会话要收尾，不能因为静音把最后一段临时内容丢掉。"""
+        transcriber = ScriptedTranscriber(["[18][S01]结尾[19]", "[18][S01]结尾[19]"])
+        session = self._session(transcriber)
+        session.push_audio(_speech(20.0))
+        self._run(session.run_pending())
+
+        session.push_audio(_silence(10.0))
+        events = self._run(session.close())
+
+        provisional_events = [event for event in events if event["type"] == "provisional"]
+        self.assertEqual(provisional_events[-1]["segments"], [])
+
+    def test_gate_can_be_disabled(self):
+        transcriber = ScriptedTranscriber(["[1][S01]a[2]"] * 3)
+        session = self._session(transcriber, silence_gate=False)
+        session.push_audio(_silence(10.0))
+
+        self._run(session.run_pending())
+
+        self.assertEqual(len(transcriber.window_seconds), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

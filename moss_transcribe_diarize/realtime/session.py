@@ -12,6 +12,7 @@ from moss_transcribe_diarize.prompts import DEFAULT_PROMPT
 
 from .buffer import AudioRingBuffer
 from .config import RealtimeConfig
+from .energy import is_silent
 from .speaker import SpeakerEmbedder, SpeakerGallery
 from .stitch import Segment, Stitcher
 from .store import SessionStore
@@ -129,6 +130,16 @@ class RealtimeSession:
             # 没有可推理的音频。推进 last_run_sec，避免每次轮询都重试。
             self._last_run_sec = decision.end_sec
             return []
+        if self.config.silence_gate and is_silent(
+            audio,
+            self.config.sample_rate,
+            self.config.silence_rms_db,
+            self.config.silence_frame_ratio,
+        ):
+            # 整窗静音：跳过推理，但必须推进 last_run_sec，否则下次轮询会重算
+            # 同一个窗口，退化成忙等。
+            self._last_run_sec = decision.end_sec
+            return [self._status_event()]
         return await self._run_window(decision.start_sec, decision.end_sec, audio)
 
     async def close(self) -> list[dict]:
