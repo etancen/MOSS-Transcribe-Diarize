@@ -2468,6 +2468,8 @@ git commit -m "feat(realtime): add SessionStore for session persistence"
 
 **Interfaces:**
 - Consumes: `RealtimeConfig`、`AudioRingBuffer`、`WindowPolicy`、`Stitcher`/`Segment`、`SpeakerGallery`/`SpeakerEmbedder`/`Assignment`、`WindowTranscriber`、`SessionStore`
+
+  **注意**：`HfWindowTranscriber` 把窗口固定写到 `<scratch_dir>/window.wav`，所以**一个实例只能串行使用**——两个并发的 `transcribe_window` 会互相覆盖同一个文件，结果错乱而不会报错。本任务的用法是每个会话构造一个实例、按顺序调用，符合这个约束。将来若要做并行推理，必须改成每窗口一个独立路径（例如带上 `window_id`），不能共享实例。
 - Produces:
   - `CommittedSegment` —— 冻结 dataclass，字段 `id`、`start`、`end`、`speaker_id`、`speaker_name`、`text`、`confident`；方法 `to_dict()` 返回 `{"id","start","end","speaker","speaker_name","text","speaker_confident"}`（与 Task 9 的测试替身字段一致）
   - `RealtimeSession(config, *, transcriber, store, embedder=None, prompt=DEFAULT_PROMPT)`
