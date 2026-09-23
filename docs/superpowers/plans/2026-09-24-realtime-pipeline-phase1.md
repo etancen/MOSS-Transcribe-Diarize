@@ -74,6 +74,12 @@ D:/Tools/miniforge3/python.exe -m venv .venv
 
 - [ ] **Step 1: 写失败测试**
 
+> **实现时的修正（以此为准）**：下面这段测试代码在实现过程中被修正过，实际交付内容见 `tests/test_package_lazy_import.py`。
+>
+> 原本规定的 `test_realtime_modules_import_without_torch` **无法失败**——它导入一个不存在的探针模块，然后断言 stderr 含 `ModuleNotFoundError` 且不含 `torch`。改动前父包因 `transformers` 被阻断而抛 `ModuleNotFoundError`（"transformers" 这个词里不含子串 "torch"），改动后因探针模块不存在而抛同样的错，所以它在 RED 和 GREEN 都通过，对这个任务的核心主张什么都没验证。
+>
+> 交付版把它换成 `test_realtime_import_path_is_torch_free`：在 torch/transformers 被阻断的子进程里导入**真实存在的**父包 `moss_transcribe_diarize`（这正是 `realtime.*` 导入最先执行的一步）并断言 `IMPORT_OK`；另加正向对照 `test_torch_backed_module_import_fails_when_blocked`，证明阻断确实生效、避免 `IMPORT_OK` 断言空转。`test_lazy_attribute_still_resolves` 也改为在全新解释器中运行并断言名字访问前不在 `vars(mtd)`、访问后被缓存进去，否则它是恒真断言。
+
 创建 `tests/test_package_lazy_import.py`：
 
 ```python
