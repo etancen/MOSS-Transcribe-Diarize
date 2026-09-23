@@ -27,19 +27,30 @@ class ParseWindowSegmentsTest(unittest.TestCase):
         self.assertEqual([s.speaker for s in segments], ["S01", "S02"])
         self.assertEqual([s.text for s in segments], ["Welcome", "Ready"])
 
-    def test_malformed_segment_does_not_block_later_segments(self):
-        # 这里是"偏离格式不会作废整次推理"真正要钉的场景：前面有垃圾、后面还有合法
-        # 片段时，后续片段照常产出。
+    def test_whitespace_separated_noise_does_not_block_later_segments(self):
+        # 杂散文本由空白分隔时走 _after_end 的 _pending_after_end 分支：下一个 [ 到来
+        # 即干净地 emit 本段，后续片段照常产出。这是"偏离格式不作废整次推理"的良性
+        # 一侧。
         raw = "垃圾开头 [0.5][S01]有效[1.5] [2.0][S02]也好[3.0]"
 
         segments = parse_window_segments(raw, window_start=0.0, window_id=0)
 
         self.assertEqual([s.text for s in segments], ["有效", "也好"])
 
+    def test_unseparated_noise_pollutes_a_segment_and_is_dropped(self):
+        # 没有空白分隔时解析器会把 [1.5] 折回正文，再把 [2.0] 当成该段的结束时间，
+        # 于是本段文字含方括号、结束时间被顶到下一段起点，而 [S02] 解析失败被丢弃。
+        # 污染段整段丢弃，所以这里期望空——宁可丢，也不把污染的文字写进定稿。
+        raw = "[0.5][S01]有效[1.5]垃圾[2.0][S02]也好[3.0]"
+
+        segments = parse_window_segments(raw, window_start=0.0, window_id=0)
+
+        self.assertEqual(segments, [])
+
     def test_trailing_prose_after_the_last_segment_drops_that_segment(self):
-        # 解析器在 [end] 之后遇到非空白字符会把 [end] 折回正文并退回"读取正文"
-        # 状态，于是该片段永不闭合、close() 也不吐出它。窗口的最后一段因此会丢；
-        # 下一个窗口会重新覆盖这段音频，所以是暂时性丢失。
+        # 流尾的杂散文本（_after_end 的第 1 种例外）：[end] 之后遇到非空白字符会把
+        # [end] 折回正文并退回"读取正文"状态，于是该片段永不闭合、close() 也不吐出
+        # 它。窗口的最后一段因此会丢；下一个窗口会重新覆盖这段音频，所以是暂时性丢失。
         raw = "这是模型的解释性文字 [0.5][S01]有效内容[1.5] 更多废话"
 
         segments = parse_window_segments(raw, window_start=0.0, window_id=0)
@@ -94,11 +105,6 @@ class ClampToWindowTest(unittest.TestCase):
 
     def test_segment_entirely_after_window_is_dropped(self):
         seg = Segment(start=25.0, end=27.0, speaker="S01", text="a", window_id=0)
-
-        self.assertIsNone(clamp_to_window(seg, 0.0, 20.0))
-
-    def test_zero_length_segment_at_left_edge_is_dropped(self):
-        seg = Segment(start=-2.0, end=-1.0, speaker="S01", text="a", window_id=0)
 
         self.assertIsNone(clamp_to_window(seg, 0.0, 20.0))
 

@@ -23,23 +23,35 @@ class Segment:
 def parse_window_segments(raw_text: str, window_start: float, window_id: int) -> list[Segment]:
     """解析模型输出，把窗口内的局部时间换算成绝对时间。
 
-    解析器（``TranscriptStreamParser``）本身会丢弃无法解析的片段，所以偏离约定
-    格式的输出只损失对应片段，不会让整次推理作废；只要后面还有合法的
-    ``[start][Sxx]``，后续片段照常产出。
+    解析器（``TranscriptStreamParser``）会丢弃它无法解析的部分，所以偏离约定格式的
+    输出通常只损失对应片段、不会让整次推理作废。
 
-    有一个例外要知道：``[end]`` 之后若跟着非空白的杂散文本，解析器会把 ``[end]``
-    折回正文、该片段永不闭合，于是**窗口的最后一段会丢**。这是解析器刻意的宽松
-    恢复策略，不在本模块修正范围。代价可接受——下一个窗口会重新覆盖这段音频，
-    所以是暂时性丢失而非永久丢失。
+    两个必须知道的例外，都源于解析器的 ``_after_end``：``[end]`` 之后若跟着非空白的
+    杂散文本，它会把 ``[end]`` 折回正文并退回"读取正文"状态。
 
-    另：时间戳顺序颠倒时解析器同样不闭合该片段（它只接受 ``end >= start``），
-    且 ``_parse_timestamp`` 不产生负值，所以这里不需要交换分支。
+    1. 流尾的杂散文本：该片段永不闭合，``close()`` 也不吐出它——窗口的最后一段丢失。
+    2. 中间位置的杂散文本：紧随其后的 ``[时间戳]`` 会被当成**本片段**的结束时间，
+       于是本片段文字被污染、结束时间被顶到下一段的起点，而那个 ``[Sxx]`` 在
+       ``_READ_START`` 状态下解析失败被丢弃，下一段随之静默消失。
+
+    第 2 种情况下本模块用"正文含方括号即判为污染、整段丢弃"来兜底（见下），把静默
+    的文字污染换成干净的丢失。两种丢失都由下一个窗口重新覆盖该音频来恢复。
+
+    另：时间戳顺序颠倒时解析器同样不闭合该片段（``_read_end`` 只接受
+    ``end >= start``），且 ``_parse_timestamp`` 不产生负值，所以这里不需要交换分支
+    ——那会是一段永远执行不到的死代码。
     """
     parser = TranscriptStreamParser()
     local = list(parser.feed(raw_text))
     local.extend(parser.close())
     out: list[Segment] = []
     for item in local:
+        # 在模型的紧凑格式里方括号是结构性的。正文中出现 ``[`` / ``]`` 说明解析器
+        # 把某个时间戳折回了正文，即该段已被污染：文字和结束时间都不对。丢弃它
+        # 可以把一次静默的定稿污染换成一次干净的丢失，而下一个窗口会重新覆盖这段
+        # 音频，所以丢失是暂时性的。没有这个兜底，被污染的段落会被写进定稿且永不修正。
+        if "[" in item.text or "]" in item.text:
+            continue
         start = window_start + float(item.start)
         end = window_start + float(item.end)
         out.append(
