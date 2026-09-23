@@ -120,6 +120,31 @@ class SpeakerGalleryTest(unittest.TestCase):
 
         self.assertEqual([a.speaker_id for a in assignments], ["S01", "S01"])
 
+    def test_same_local_label_in_different_windows_is_not_merged(self):
+        # 分组的键是 (window_id, 局部标签)。局部标签只是**窗口内**的先验：窗口 A 的
+        # S01 与窗口 B 的 S01 完全可以是两个人，按 seg.speaker 单独分组会把不同的人
+        # 合并成一个全局说话人。
+        #
+        # 注意：当前唯一的调用方每个窗口调用 assign 一次，所以本次调用里的段共享同一个
+        # window_id，这个键分量今天是**防御性**的。这条测试钉的是意图——将来若有人把键
+        # 简化成 seg.speaker，应当是一次可见的决定，而不是一个静默的改动。
+        first = _voice(1.0)
+        second = _voice(2.0)
+        gallery = SpeakerGallery(
+            FakeEmbedder({first.tobytes(): [1.0, 0.0, 0.0], second.tobytes(): [0.0, 1.0, 0.0]})
+        )
+
+        assignments = gallery.assign(
+            [
+                _seg(0.0, 1.0, "S01", window_id=0),
+                _seg(20.0, 21.0, "S01", window_id=1),
+            ],
+            lambda seg: first if seg.window_id == 0 else second,
+        )
+
+        self.assertEqual([a.speaker_id for a in assignments], ["S01", "S02"])
+        self.assertEqual(len(gallery.speakers()), 2)
+
     def test_unembeddable_group_is_marked_unconfident(self):
         gallery = SpeakerGallery(FakeEmbedder({}), min_segment_sec=0.1)
 
