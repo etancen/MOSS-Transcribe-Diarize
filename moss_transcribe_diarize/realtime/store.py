@@ -117,7 +117,11 @@ class SessionStore:
         if not path.exists():
             return []
         rows: list[dict] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
+        # ``errors="replace"`` 而不是默认的严格解码：文件是逐条追加的，崩溃可能把最后
+        # 一行切断在某个多字节字符中间。严格模式会因这一个坏字符让**整份转写**抛
+        # ``UnicodeDecodeError``，而正确行为只是丢掉那一行。坏字节解成 U+FFFD 后，
+        # 该行的 JSON 解析失败、被下面的 except 跳过，前面的行照常返回。
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -149,7 +153,9 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        # 同 ``load_committed``：被切断在字符中间的元信息解成 U+FFFD 后 JSON 解析失败，
+        # 走 except 返回空字典，而不是让一个坏文件把整个 ``list_sessions`` 拖崩。
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}

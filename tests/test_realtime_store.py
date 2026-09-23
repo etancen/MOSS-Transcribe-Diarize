@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -75,6 +76,18 @@ class SessionStoreTest(unittest.TestCase):
         written, _ = sf.read(str(store.audio_path), dtype="float32")
         self.assertEqual(written.shape, (1200,))
 
+    def test_finalize_leaves_a_valid_wav_header(self):
+        # 只断言"能读回采样"抓不住"句柄没关闭"——libsndfile 读自己写的文件时会容忍
+        # 过期的长度字段。直接断言 RIFF 的长度字段与文件实际长度一致。
+        store = self._store()
+        store.append_audio(np.zeros(16000, dtype=np.float32))
+        store.finalize([])
+
+        data = store.audio_path.read_bytes()
+        riff_size = struct.unpack("<I", data[4:8])[0]
+
+        self.assertEqual(riff_size, len(data) - 8)
+
     def test_no_audio_file_when_recording_is_disabled(self):
         store = self._store(record_audio=False)
         store.append_audio(np.zeros(800, dtype=np.float32))
@@ -111,6 +124,29 @@ class SessionStoreTest(unittest.TestCase):
         rows = SessionStore.load_committed(self.runs, "sess-1")
 
         self.assertEqual([row["id"] for row in rows], ["seg-1"])
+
+    def test_torn_multibyte_tail_does_not_lose_earlier_segments(self):
+        # 尾部被切断在**多字节汉字中间**时，若实现是"先解码整个文件再切行"，
+        # UnicodeDecodeError 会带走整份转写——而不是只丢最后一条。
+        store = self._store()
+        store.append_committed([FakeCommitted("seg-1", 0.0, 1.0, "S01", "S01", "你好", True)])
+        raw = store.transcript_path.read_bytes()
+        store.transcript_path.write_bytes(raw + "好".encode("utf-8")[:2])
+
+        rows = SessionStore.load_committed(self.runs, "sess-1")
+
+        self.assertEqual([row["id"] for row in rows], ["seg-1"])
+
+    def test_torn_multibyte_meta_is_skipped_by_list_sessions(self):
+        # Finding 1 的另一半：同样的截断发生在 session.json 上时，_read_json_object
+        # 也必须走"替换坏字节再跳过"，而不是让 list_sessions 抛 UnicodeDecodeError。
+        SessionStore(self.runs, "a").write_meta()
+        (self.runs / "b").mkdir(parents=True)
+        (self.runs / "b" / "session.json").write_bytes(b'{"session_id": "b"}' + "坏".encode("utf-8")[:2])
+
+        listed = SessionStore.list_sessions(self.runs)
+
+        self.assertEqual([item["session_id"] for item in listed], ["a"])
 
     def test_provisional_snapshot_round_trips(self):
         store = self._store()
