@@ -5,9 +5,15 @@ import unittest
 from moss_transcribe_diarize.realtime.stitch import (
     MIN_SEGMENT_DURATION,
     Segment,
+    Stitcher,
     clamp_to_window,
     parse_window_segments,
 )
+
+
+def _rawl(*triples) -> str:
+    """把 (start, end, speaker, text) 四元组拼成模型输出格式。"""
+    return "".join(f"[{s}][{sp}]{t}[{e}]" for s, e, sp, t in triples)
 
 
 class ParseWindowSegmentsTest(unittest.TestCase):
@@ -134,6 +140,166 @@ class ClampToWindowTest(unittest.TestCase):
         )
 
         self.assertIsNone(clamp_to_window(seg, 0.0, 20.0))
+
+
+class StitcherTest(unittest.TestCase):
+    def test_commits_segments_older_than_tail(self):
+        stitcher = Stitcher(window=20.0, tail=6.0)
+
+        result = stitcher.ingest(
+            window_start=0.0,
+            window_end=20.0,
+            raw_text=_rawl((1.0, 3.0, "S01", "早")),
+            window_id=0,
+        )
+
+        self.assertEqual([s.text for s in result.committed], ["早"])
+        self.assertEqual(result.provisional, [])
+        self.assertEqual(stitcher.committed_until, 3.0)
+
+    def test_holds_back_segments_inside_tail(self):
+        stitcher = Stitcher(window=20.0, tail=6.0)
+
+        result = stitcher.ingest(
+            window_start=0.0,
+            window_end=20.0,
+            raw_text=_rawl((16.0, 19.0, "S01", "新")),
+            window_id=0,
+        )
+
+        self.assertEqual(result.committed, [])
+        self.assertEqual([s.text for s in result.provisional], ["新"])
+        self.assertEqual(stitcher.committed_until, 0.0)
+
+    def test_provisional_is_replaced_not_appended(self):
+        stitcher = Stitcher(window=20.0, tail=6.0)
+        stitcher.ingest(
+            window_start=0.0, window_end=20.0,
+            raw_text=_rawl((16.0, 19.0, "S01", "第一版")), window_id=0,
+        )
+
+        # 第二个窗口是 [5, 25]，raw 里的时间戳是**窗口局部**的，会被加上 window_start。
+        # 局部 15.0-18.5 换算成绝对 20.0-23.5，落在 tail 区（> 25-6=19）内，所以是临时段。
+        # 用它替换第一次的临时快照，而不是追加——这是 provisional 的语义。
+        result = stitcher.ingest(
+            window_start=5.0, window_end=25.0,
+            raw_text=_rawl((15.0, 18.5, "S01", "第二版")), window_id=1,
+        )
+
+        self.assertEqual([s.text for s in result.provisional], ["第二版"])
+
+    def test_already_committed_segment_is_not_recommitted(self):
+        stitcher = Stitcher(window=20.0, tail=6.0)
+        first = stitcher.ingest(
+            window_start=0.0, window_end=20.0,
+            raw_text=_rawl((1.0, 3.0, "S01", "早")), window_id=0,
+        )
+        self.assertEqual([s.text for s in first.committed], ["早"])
+        self.assertEqual(stitcher.committed_until, 3.0)
+
+        # 同一个窗口再跑一次，模型对同一段音频给出同样的结果。去重靠时间水位线，不靠
+        # 文字比对：该段的 end 已等于 committed_until，整段落在水位线之前，丢弃。
+        result = stitcher.ingest(
+            window_start=0.0, window_end=20.0,
+            raw_text=_rawl((1.0, 3.0, "S01", "早")), window_id=1,
+        )
+
+        self.assertEqual(result.committed, [])
+        self.assertEqual(stitcher.committed_until, 3.0)
+
+    def test_segment_straddling_the_watermark_is_dropped(self):
+        stitcher = Stitcher(window=20.0, tail=6.0)
+        stitcher.ingest(
+            window_start=0.0, window_end=20.0,
+            raw_text=_rawl((5.0, 10.0, "S01", "前半")), window_id=0,
+        )
+
+        result = stitcher.ingest(
+            window_start=0.0, window_end=20.0,
+            raw_text=_rawl((8.0, 12.0, "S01", "重叠")), window_id=1,
+        )
+
+        self.assertEqual(result.committed, [])
+        self.assertEqual(stitcher.committed_until, 10.0)
+
+    def test_out_of_range_timestamp_never_advances_the_watermark(self):
+        stitcher = Stitcher(window=20.0, tail=6.0)
+
+        result = stitcher.ingest(
+            window_start=0.0, window_end=20.0,
+            raw_text=_rawl((1.0, 3.0, "S01", "正常"), (5000.0, 9000.0, "S02", "未来")),
+            window_id=0,
+        )
+
+        self.assertEqual([s.text for s in result.committed], ["正常"])
+        self.assertEqual(stitcher.committed_until, 3.0)
+
+    def test_later_window_can_still_commit_after_an_out_of_range_spike(self):
+        stitcher = Stitcher(window=20.0, tail=6.0)
+        stitcher.ingest(
+            window_start=0.0, window_end=20.0,
+            raw_text=_rawl((5000.0, 9000.0, "S02", "未来")), window_id=0,
+        )
+
+        result = stitcher.ingest(
+            window_start=5.0, window_end=25.0,
+            raw_text=_rawl((6.0, 9.0, "S01", "后续正常")), window_id=1,
+        )
+
+        self.assertEqual([s.text for s in result.committed], ["后续正常"])
+
+    def test_committed_segments_are_returned_in_time_order(self):
+        stitcher = Stitcher(window=20.0, tail=0.0)
+
+        result = stitcher.ingest(
+            window_start=0.0, window_end=20.0,
+            raw_text=_rawl((8.0, 9.0, "S02", "后"), (1.0, 2.0, "S01", "前")),
+            window_id=0,
+        )
+
+        self.assertEqual([s.text for s in result.committed], ["前", "后"])
+
+    def test_flush_promotes_remaining_provisional(self):
+        stitcher = Stitcher(window=20.0, tail=6.0)
+        stitcher.ingest(
+            window_start=0.0, window_end=20.0,
+            raw_text=_rawl((16.0, 19.0, "S01", "末尾")), window_id=0,
+        )
+
+        flushed = stitcher.flush()
+
+        self.assertEqual([s.text for s in flushed], ["末尾"])
+        self.assertEqual(stitcher.flush(), [])
+        self.assertEqual(stitcher.committed_until, 19.0)
+
+    def test_rejects_tail_at_or_past_window(self):
+        with self.assertRaises(ValueError):
+            Stitcher(window=10.0, tail=10.0)
+
+
+class StitcherUnparseableOutputTest(unittest.TestCase):
+    def test_garbage_text_does_not_block_valid_segments(self):
+        stitcher = Stitcher(window=20.0, tail=6.0)
+
+        result = stitcher.ingest(
+            window_start=0.0,
+            window_end=20.0,
+            raw_text="抱歉，我无法处理这段音频。" + _rawl((2.0, 4.0, "S01", "有效")),
+            window_id=0,
+        )
+
+        self.assertEqual([s.text for s in result.committed], ["有效"])
+
+    def test_fully_unparseable_output_yields_nothing(self):
+        stitcher = Stitcher(window=20.0, tail=6.0)
+
+        result = stitcher.ingest(
+            window_start=0.0, window_end=20.0, raw_text="没有任何时间戳", window_id=0,
+        )
+
+        self.assertEqual(result.committed, [])
+        self.assertEqual(result.provisional, [])
+        self.assertEqual(stitcher.committed_until, 0.0)
 
 
 if __name__ == "__main__":

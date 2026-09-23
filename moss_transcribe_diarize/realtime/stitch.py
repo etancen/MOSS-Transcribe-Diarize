@@ -83,3 +83,73 @@ def clamp_to_window(seg: Segment, window_start: float, window_end: float) -> Seg
     if start == seg.start:
         return seg
     return replace(seg, start=start)
+
+
+@dataclass(slots=True)
+class StitchResult:
+    committed: list[Segment]
+    provisional: list[Segment]
+
+
+class Stitcher:
+    """把逐次窗口推理的结果，切成定稿区与临时区。
+
+    ``committed_until`` 是一条只进不退的水位线：只有严格位于它之后的段落才会
+    被定稿。靠它天然去重——相邻窗口的定稿区在时间上重叠，但同一段内容只会被
+    定稿一次。
+    """
+
+    def __init__(self, *, window: float, tail: float):
+        if window <= 0:
+            raise ValueError("window must be positive")
+        if not 0.0 <= tail < window:
+            raise ValueError("tail must be in [0, window)")
+        self.window = float(window)
+        self.tail = float(tail)
+        self._committed_until = 0.0
+        self._provisional: list[Segment] = []
+
+    @property
+    def committed_until(self) -> float:
+        return self._committed_until
+
+    @property
+    def provisional(self) -> list[Segment]:
+        return list(self._provisional)
+
+    def ingest(
+        self,
+        *,
+        window_start: float,
+        window_end: float,
+        raw_text: str,
+        window_id: int,
+    ) -> StitchResult:
+        candidates: list[Segment] = []
+        for seg in parse_window_segments(raw_text, window_start, window_id):
+            clamped = clamp_to_window(seg, window_start, window_end)
+            if clamped is None:
+                continue
+            if clamped.end <= self._committed_until:
+                continue
+            if clamped.start < self._committed_until:
+                # 跨水位线，几乎总是上一次推理已定稿内容的重叠部分。重复比少量
+                # 丢失更刺眼，所以整段丢弃，且不推进水位线。
+                continue
+            candidates.append(clamped)
+        candidates.sort(key=lambda item: (item.start, item.end))
+
+        cutoff = window_end - self.tail
+        committed = [seg for seg in candidates if seg.end <= cutoff]
+        self._provisional = [seg for seg in candidates if seg.end > cutoff]
+        if committed:
+            self._committed_until = max(self._committed_until, committed[-1].end)
+        return StitchResult(committed=committed, provisional=list(self._provisional))
+
+    def flush(self) -> list[Segment]:
+        """把临时区里剩下的段落全部定稿。会话结束时调用。"""
+        remaining = self._provisional
+        self._provisional = []
+        if remaining:
+            self._committed_until = max(self._committed_until, remaining[-1].end)
+        return remaining
