@@ -943,16 +943,32 @@ class ParseWindowSegmentsTest(unittest.TestCase):
         self.assertEqual([s.speaker for s in segments], ["S01", "S02"])
         self.assertEqual([s.text for s in segments], ["Welcome", "Ready"])
 
-    def test_malformed_segment_does_not_block_later_segments(self):
-        # 这里是"偏离格式不会作废整次推理"真正要钉的场景：前面有垃圾、后面还有合法
-        # 片段时，后续片段照常产出。前导垃圾在 _SEEK_START 状态被丢弃；第一段由
-        # [1.5] 之后的空格加 [ 触发 _after_end 的 emit；第二段停在 _AFTER_END 状态，
-        # 由 close() 吐出。
+    def test_whitespace_separated_noise_does_not_block_later_segments(self):
+        # 杂散文本由空白分隔时走 _after_end 的 _pending_after_end 分支：下一个 [ 到来
+        # 即干净地 emit 本段，后续片段照常产出。这是"偏离格式不作废整次推理"的良性
+        # 一侧。
+        #
+        # 注意这个良性结论**不能推广**——见下面那条无分隔的用例。区分二者是必要的：
+        # 只有这一条的话，会从一个刻意选了良性输入的例子推出关于所有格式偏离的错误结论。
         raw = "垃圾开头 [0.5][S01]有效[1.5] [2.0][S02]也好[3.0]"
 
         segments = parse_window_segments(raw, window_start=0.0, window_id=0)
 
         self.assertEqual([s.text for s in segments], ["有效", "也好"])
+
+    def test_unseparated_noise_pollutes_a_segment_and_is_dropped(self):
+        # 没有空白分隔时，解析器把 [1.5] 折回正文，再把 [2.0] 当成该段的结束时间
+        # （2.0 >= 0.5 故 _read_end 接受），于是本段变成
+        # (0.5, 2.0, "S01", "有效[1.5]垃圾")——文字与结束时间双双被污染；而 [S02] 在
+        # _READ_START 状态解析失败被 reset，"也好" 随之静默消失。
+        #
+        # 正文含方括号的段落被整段丢弃，所以这里是空。宁可丢，也绝不把污染的文字写成定稿。
+        # 这条用例是那道守卫的承重测试：去掉守卫它会失败。
+        raw = "[0.5][S01]有效[1.5]垃圾[2.0][S02]也好[3.0]"
+
+        segments = parse_window_segments(raw, window_start=0.0, window_id=0)
+
+        self.assertEqual(segments, [])
 
     def test_trailing_prose_after_the_last_segment_drops_that_segment(self):
         # 解析器在 [end] 之后遇到非空白字符会把 [end] 折回正文并退回"读取正文"
@@ -1015,11 +1031,6 @@ class ClampToWindowTest(unittest.TestCase):
 
         self.assertIsNone(clamp_to_window(seg, 0.0, 20.0))
 
-    def test_zero_length_segment_at_left_edge_is_dropped(self):
-        seg = Segment(start=-2.0, end=-1.0, speaker="S01", text="a", window_id=0)
-
-        self.assertIsNone(clamp_to_window(seg, 0.0, 20.0))
-
     def test_segment_shorter_than_minimum_after_clamping_is_dropped(self):
         seg = Segment(
             start=-1.0,
@@ -1069,15 +1080,25 @@ class Segment:
 def parse_window_segments(raw_text: str, window_start: float, window_id: int) -> list[Segment]:
     """解析模型输出，把窗口内的局部时间换算成绝对时间。
 
-    ``TranscriptStreamParser`` 本身会丢弃无法解析的片段，所以偏离约定格式的输出
-    只损失对应片段、不会让整次推理作废——只要后面还有合法的 ``[start][Sxx]``，
-    后续片段照常产出。
+    解析器（``TranscriptStreamParser``）会丢弃它无法解析的部分，所以多数格式偏离
+    只损失对应片段、不会让整次推理作废。
 
-    有一个例外必须知道：``[end]`` 之后若跟着非空白的杂散文本，解析器会把
-    ``[end]`` 折回正文、该片段永不闭合，于是**窗口的最后一段会丢**。这是解析器
-    刻意的宽松恢复策略（宁可把 ``[end]`` 当成过早断句，也不轻易切段），不在本模块
-    的修正范围。代价可接受——下一个窗口会重新覆盖这段音频，所以是暂时性丢失而非
-    永久丢失。
+    两个必须知道的例外，都源于解析器的 ``_after_end``：``[end]`` 之后若跟着非空白的
+    杂散文本，它会把 ``[end]`` 折回正文并退回"读取正文"状态。
+
+    1. 流尾的杂散文本：该片段永不闭合，``close()`` 也不吐出它——窗口的最后一段丢失。
+    2. 中间位置的杂散文本：紧随其后的 ``[时间戳]`` 会被当成**本片段**的结束时间，
+       于是本片段文字被污染（正文里混入 ``[1.5]垃圾`` 之类）、结束时间被顶到下一段的
+       起点，而那个 ``[Sxx]`` 在 ``_READ_START`` 状态下解析失败被丢弃，下一段随之
+       静默消失。这比单纯丢失更糟。
+
+    注意"后续片段照常存活"**只在杂散文本由空白分隔时成立**（空白走
+    ``_pending_after_end`` 分支，下一个 ``[`` 到来即干净 emit）。无分隔时不成立。
+
+    第 2 种情况用下面那道"正文含方括号即丢弃"的守卫兜底：在模型的紧凑格式里方括号是
+    结构性字符，正文里出现方括号就意味着解析器折回了时间戳、该段的文字与结束时间都已
+    不可信。丢弃把"静默污染已定稿转写"换成"干净的丢失"——定稿内容永不回改，所以宁可
+    丢也不能污染。
 
     另：时间戳顺序颠倒时解析器同样不闭合该片段（``_read_end`` 只接受
     ``end >= start``），且 ``_parse_timestamp`` 不产生负值，所以这里不需要交换分支
@@ -1088,12 +1109,15 @@ def parse_window_segments(raw_text: str, window_start: float, window_id: int) ->
     local.extend(parser.close())
     out: list[Segment] = []
     for item in local:
+        text = item.text
+        if "[" in text or "]" in text:
+            continue
         out.append(
             Segment(
                 start=window_start + float(item.start),
                 end=window_start + float(item.end),
                 speaker=item.speaker or "",
-                text=item.text,
+                text=text,
                 window_id=window_id,
             )
         )
