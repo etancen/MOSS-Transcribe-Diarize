@@ -956,19 +956,37 @@ class ParseWindowSegmentsTest(unittest.TestCase):
 
         self.assertEqual([s.text for s in segments], ["有效", "也好"])
 
-    def test_unseparated_noise_pollutes_a_segment_and_is_dropped(self):
+    def test_brackets_inside_speech_are_preserved(self):
+        # transcript_parser 有明确的契约（tests/test_transcript_parser.py 的
+        # test_numeric_brackets_inside_text_are_preserved）：正文里的方括号是被刻意
+        # 保留的，不是污染。任何"正文含方括号就丢弃"的判据都会误伤这条。
+        #
+        # 这条用例是防止重犯同一错误的回归守卫——它比看起来更重要：本阶段曾有人
+        # （控制器）为了防污染加过一道方括号守卫，恰好会丢掉这类合法内容，而当时
+        # 的测试全都用不含括号的中文正文，覆盖不到误伤路径。
+        raw = "[0][S01]第[2024]年，编号[001]继续[4]"
+
+        segments = parse_window_segments(raw, window_start=0.0, window_id=0)
+
+        self.assertEqual([s.text for s in segments], ["第[2024]年，编号[001]继续"])
+
+    def test_unseparated_noise_pollutes_a_segment_and_we_pass_it_through(self):
         # 没有空白分隔时，解析器把 [1.5] 折回正文，再把 [2.0] 当成该段的结束时间
         # （2.0 >= 0.5 故 _read_end 接受），于是本段变成
         # (0.5, 2.0, "S01", "有效[1.5]垃圾")——文字与结束时间双双被污染；而 [S02] 在
         # _READ_START 状态解析失败被 reset，"也好" 随之静默消失。
         #
-        # 正文含方括号的段落被整段丢弃，所以这里是空。宁可丢，也绝不把污染的文字写成定稿。
-        # 这条用例是那道守卫的承重测试：去掉守卫它会失败。
+        # 本模块原样透传，不做修补：解析器无法区分这种污染与它刻意保留的正文方括号
+        # （见下面那条用例），任何"含括号就丢弃"的判据都会误伤合法内容。这段音频会由
+        # 下一个窗口重新覆盖，所以是暂时性丢失。
+        #
+        # 钉住这个丑陋的行为是刻意的：后来者若想"顺手修一下"，会先看到自己拿什么去换。
         raw = "[0.5][S01]有效[1.5]垃圾[2.0][S02]也好[3.0]"
 
         segments = parse_window_segments(raw, window_start=0.0, window_id=0)
 
-        self.assertEqual(segments, [])
+        self.assertEqual([s.text for s in segments], ["有效[1.5]垃圾"])
+        self.assertEqual(segments[0].end, 2.0)
 
     def test_trailing_prose_after_the_last_segment_drops_that_segment(self):
         # 解析器在 [end] 之后遇到非空白字符会把 [end] 折回正文并退回"读取正文"
@@ -1095,10 +1113,14 @@ def parse_window_segments(raw_text: str, window_start: float, window_id: int) ->
     注意"后续片段照常存活"**只在杂散文本由空白分隔时成立**（空白走
     ``_pending_after_end`` 分支，下一个 ``[`` 到来即干净 emit）。无分隔时不成立。
 
-    第 2 种情况用下面那道"正文含方括号即丢弃"的守卫兜底：在模型的紧凑格式里方括号是
-    结构性字符，正文里出现方括号就意味着解析器折回了时间戳、该段的文字与结束时间都已
-    不可信。丢弃把"静默污染已定稿转写"换成"干净的丢失"——定稿内容永不回改，所以宁可
-    丢也不能污染。
+    本模块**不**去修补这两种情况，因为修补不了：解析器把"正文里本来就有的方括号"
+    和"被折回的时间戳"处理成同一种结果（都走 ``_after_end``，后面跟的都是任意文本），
+    所以任何"正文含方括号就丢弃"之类的判据都会误伤合法内容——正文里的方括号是
+    ``transcript_parser`` 有测试固定下来的刻意保留行为
+    （``tests/test_transcript_parser.py`` 的 ``test_numeric_brackets_inside_text_are_preserved``）。
+    误伤的代价是静默丢内容，比带可见 ``[1.5]`` 痕迹的污染更隐蔽。
+
+    两种例外都由**下一个窗口重新覆盖该段音频**来恢复，属于暂时性丢失而非永久丢失。
 
     另：时间戳顺序颠倒时解析器同样不闭合该片段（``_read_end`` 只接受
     ``end >= start``），且 ``_parse_timestamp`` 不产生负值，所以这里不需要交换分支
@@ -1109,15 +1131,12 @@ def parse_window_segments(raw_text: str, window_start: float, window_id: int) ->
     local.extend(parser.close())
     out: list[Segment] = []
     for item in local:
-        text = item.text
-        if "[" in text or "]" in text:
-            continue
         out.append(
             Segment(
                 start=window_start + float(item.start),
                 end=window_start + float(item.end),
                 speaker=item.speaker or "",
-                text=text,
+                text=item.text,
                 window_id=window_id,
             )
         )
