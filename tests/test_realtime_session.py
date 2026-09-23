@@ -553,18 +553,23 @@ class SilenceGateTest(unittest.TestCase):
         self.assertEqual(len(transcriber.window_seconds), 1)
         self.assertIn("committed", [event["type"] for event in events])
 
-    def test_close_runs_even_when_the_final_window_is_silent(self):
-        """关会话要收尾，不能因为静音把最后一段临时内容丢掉。"""
-        transcriber = ScriptedTranscriber(["[18][S01]结尾[19]", "[18][S01]结尾[19]"])
+    def test_close_runs_the_final_window_even_when_it_is_silent(self):
+        # close() 刻意**不**经过静音门控：收尾那一窗是为了让临时区拿到最新结果。
+        # 构造一个整段安静的收尾窗口，就能从转写器的调用次数上直接看出来——门控若
+        # 在这里生效，最后这一窗根本不会被推理。
+        #
+        # 时序：前 8 秒有语音（首窗 [0,8] 出一段临时段），之后 22 秒全静音，于是
+        # total = 30 时收尾窗口是 [10, 30]，整段落在这段静音里。
+        transcriber = ScriptedTranscriber(["[6][S01]旧[7]", "[1][S01]新[2]"])
         session = self._session(transcriber)
-        session.push_audio(_speech(20.0))
+        session.push_audio(_speech(8.0))
         self._run(session.run_pending())
+        calls_after_first_run = len(transcriber.window_seconds)
 
-        session.push_audio(_silence(10.0))
-        events = self._run(session.close())
+        session.push_audio(_silence(22.0))
+        self._run(session.close())
 
-        provisional_events = [event for event in events if event["type"] == "provisional"]
-        self.assertEqual(provisional_events[-1]["segments"], [])
+        self.assertEqual(len(transcriber.window_seconds), calls_after_first_run + 1)
 
     def test_gate_can_be_disabled(self):
         transcriber = ScriptedTranscriber(["[1][S01]a[2]"] * 3)
