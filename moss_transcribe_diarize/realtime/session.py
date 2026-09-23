@@ -144,18 +144,39 @@ class RealtimeSession:
             if window_audio is not None and window_audio.size:
                 # 用正常的 tail 再跑一次，让临时区拿到最新推理结果，再整段定稿。
                 events.extend(await self._run_window(window_start, total, window_audio))
-        remaining = self._stitcher.flush()
-        if remaining:
-            newly = self._commit(remaining, window_audio, window_start)
+        loop = asyncio.get_running_loop()
+        # 收尾同样是阻塞工作：_commit 里的声纹嵌入要跑模型，finalize 要关 WAV 并重写元
+        # 信息。整段放进工作线程，理由与逐窗路径相同——否则收尾期间事件循环被占住，在
+        # WebSocket 传输下整个服务这段时间都不响应。
+        had_remaining, newly = await loop.run_in_executor(
+            None, self._teardown, window_audio, window_start
+        )
+        if had_remaining:
             if newly:
                 events.append({"type": "committed", "segments": [seg.to_dict() for seg in newly]})
             events.append({"type": "provisional", "segments": []})
         events.append({"type": "speaker", "speakers": self._gallery.speakers()})
         self._closed = True
-        self._store.finalize(self._gallery.speakers())
         return events
 
     # --- 内部 ---
+
+    def _teardown(
+        self,
+        window_audio: np.ndarray | None,
+        window_start: float,
+    ) -> tuple[bool, list[CommittedSegment]]:
+        """会话收尾：定稿临时区、落盘、关闭录音文件。
+
+        与 ``_process_window`` 一样整个在工作线程里跑。返回的两个值正是事件构造需要
+        的：本次 flush 是否有内容（决定要不要补一个"临时区已清空"事件），以及新定稿
+        的段落。在工作线程里改 stitcher / gallery / store / 段落计数器是安全的，理由
+        与 ``_process_window`` 相同——一次会话里这些状态只被串行触碰。
+        """
+        remaining = self._stitcher.flush()
+        newly = self._commit(remaining, window_audio, window_start)
+        self._store.finalize(self._gallery.speakers())
+        return bool(remaining), newly
 
     async def _run_window(self, start: float, end: float, audio: np.ndarray) -> list[dict]:
         window_id = self._window_id

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import threading
 import unittest
 import weakref
 from pathlib import Path
@@ -442,6 +443,44 @@ class RealtimeSessionTest(unittest.TestCase):
         committed = next(event for event in events if event["type"] == "committed")
         self.assertEqual([seg["text"] for seg in committed["segments"]], ["新"])
         self.assertEqual(len(transcriber.window_seconds), 2)
+
+    def test_close_runs_the_blocking_teardown_off_the_event_loop_thread(self):
+        """close() 的收尾（声纹嵌入、关 WAV、写元信息）必须在工作线程里跑。
+
+        事件内容在两种实现下完全一样，所以"跑在哪个线程上"是这条路径唯一可观测的差
+        异，只能记录线程标识。两个窗口都只产出临时段，逐窗路径不会调用嵌入器，于是嵌
+        入器唯一的一次调用必然来自 close() 的 flush；若收尾退回事件循环线程，嵌入器
+        看到的 ident 就等于循环线程的 ident。
+        """
+        class ThreadRecordingEmbedder:
+            embedding_dim = 2
+            idents: list[int] = []
+
+            def embed(self, audio, sample_rate):
+                ThreadRecordingEmbedder.idents.append(threading.get_ident())
+                return np.array([1.0, 0.0], dtype=np.float32)
+
+        ThreadRecordingEmbedder.idents = []
+        transcriber = ScriptedTranscriber(["[18][S01]结尾[19]", "[18][S01]结尾[19]"])
+        session = RealtimeSession(
+            _config(),
+            transcriber=transcriber,
+            store=SessionStore(self.runs, "s1"),
+            embedder=ThreadRecordingEmbedder(),
+        )
+        session.push_audio(_speech(20.0))
+        self._run(session.run_pending())
+
+        async def close_inside_the_loop():
+            loop_ident = threading.get_ident()
+            events = await session.close()
+            return loop_ident, events
+
+        loop_ident, events = self._run(close_inside_the_loop())
+
+        self.assertIn("committed", [event["type"] for event in events])
+        self.assertEqual(len(ThreadRecordingEmbedder.idents), 1)
+        self.assertNotEqual(ThreadRecordingEmbedder.idents[0], loop_ident)
 
     def test_push_after_close_retains_no_audio(self):
         """关闭后再推流不得被会话保留。
