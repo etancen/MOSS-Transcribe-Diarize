@@ -2468,6 +2468,12 @@ git commit -m "feat(realtime): add SessionStore for session persistence"
 - Create: `moss_transcribe_diarize/realtime/session.py`
 - Test: `tests/test_realtime_session.py`
 
+> **实现时的修正（以此为准）**：计划本节的测试清单不是最终形态，实际交付见 `tests/test_realtime_session.py`（25 条）。差异有三处：
+>
+> 1. `test_status_event_reports_transcript_lag` 的期望值原为 `17.0`，**两种读法下都不成立**（读法 B 得 28.0；而计划注释自己写的 `[10,30]` 前提得 18.0，因段落 `[1][S01]a[2]` 是区间 (1,2)、在 `[10,30]` 窗口下落在绝对 (11,12) 而非 (11,13)）。已改为 `28.0` 并重写注释说明首窗是 `[0,30]`。
+> 2. 补了 **6 条测试**，每条对应一个计划未覆盖的变异（`_last_run_sec` 推进时机、把环形缓冲而非窗口副本交给声纹库、窗口失败被当作致命、失败计数不复位、`provisional` 改为追加、`close()` 不重跑推理就提升临时段）。每条施加对应编辑后**恰好只有它自己失败**，已逐条实测。
+> 3. `push_audio` 的空输入守卫**刻意不测**——它确实没有可观测后果（`buffer.py` 与 `store.py` 各自已守住空输入），删掉它不会改变任何行为。一条删掉无影响的守卫，如实报告比用一条无法失败的测试糊上更好。
+
 **Interfaces:**
 - Consumes: `RealtimeConfig`、`AudioRingBuffer`、`WindowPolicy`、`Stitcher`/`Segment`、`SpeakerGallery`/`SpeakerEmbedder`/`Assignment`、`WindowTranscriber`、`SessionStore`
 
@@ -2729,9 +2735,10 @@ class RealtimeSessionTest(unittest.TestCase):
         events = self._run(session.run_pending())
 
         status = next(event for event in events if event["type"] == "status")
-        # 窗口是 [10,30]，段落在窗口内 1-2 秒，换算回绝对时间就是 11-13 秒，
-        # 于是定稿到 13 秒；而缓冲里已有 30 秒音频，所以字幕落后 17 秒。
-        self.assertAlmostEqual(status["lag_sec"], 17.0, places=1)
+        # 首次运行的窗口是 [0, 30]：Ruling 15 的读法 B 规定首窗左边界恒为 0，不能套用
+        # 后续窗口的 max(0, total - window)。段落局部 1-2 秒即绝对 1-2 秒，低于
+        # cutoff = 30 - 6 = 24，故被定稿、水位线推到 2.0。字幕落后 = 缓冲 30 - 定稿 2 = 28。
+        self.assertAlmostEqual(status["lag_sec"], 28.0, places=1)
         self.assertAlmostEqual(status["buffered_sec"], 30.0, places=1)
         self.assertIn("rtf", status)
 
