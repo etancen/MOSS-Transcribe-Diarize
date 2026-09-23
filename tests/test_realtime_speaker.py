@@ -1,0 +1,184 @@
+from __future__ import annotations
+
+import unittest
+
+import numpy as np
+
+from moss_transcribe_diarize.realtime.speaker import (
+    UNKNOWN_SPEAKER_ID,
+    SpeakerGallery,
+)
+from moss_transcribe_diarize.realtime.stitch import Segment
+
+
+class FakeEmbedder:
+    """按预设的向量表返回嵌入，未登记的输入返回 None。"""
+
+    embedding_dim = 3
+
+    def __init__(self, mapping: dict[bytes, list[float]], *, default=None):
+        self.mapping = {key: np.array(value, dtype=np.float32) for key, value in mapping.items()}
+        self.default = None if default is None else np.array(default, dtype=np.float32)
+
+    def embed(self, audio, sample_rate):
+        key = np.asarray(audio, dtype=np.float32).tobytes()
+        return self.mapping.get(key, self.default)
+
+
+def _voice(value: float, *, samples: int = 8000) -> np.ndarray:
+    """一段足够长的假音频，用填充值区分身份。
+
+    长度必须超过 SpeakerGallery 的 min_segment_sec 门槛（默认 0.4 秒 = 6400 样本），
+    否则每个分组都拿不到嵌入，测试会静默退化成"未知说话人"而看不出为什么。
+    想测试"太短所以拿不到嵌入"的场景，就显式传一个小的 samples。
+    """
+    return np.full(samples, value, dtype=np.float32)
+
+
+def _seg(start: float, end: float, speaker: str, window_id: int, text: str = "x") -> Segment:
+    return Segment(start=start, end=end, speaker=speaker, text=text, window_id=window_id)
+
+
+class SpeakerGalleryTest(unittest.TestCase):
+    def test_disabled_gallery_falls_back_to_local_labels(self):
+        gallery = SpeakerGallery(None)
+
+        self.assertFalse(gallery.enabled)
+        assignments = gallery.assign([_seg(0.0, 1.0, "S02", 0)], lambda seg: None)
+
+        self.assertEqual(assignments[0].speaker_id, "S02")
+        self.assertFalse(assignments[0].confident)
+
+    def test_first_speaker_gets_first_global_id(self):
+        voice = _voice(1.0)
+        gallery = SpeakerGallery(FakeEmbedder({voice.tobytes(): [1.0, 0.0, 0.0]}))
+
+        assignments = gallery.assign([_seg(0.0, 1.0, "S02", 0)], lambda seg: voice)
+
+        self.assertEqual(assignments[0].speaker_id, "S01")
+        self.assertTrue(assignments[0].confident)
+
+    def test_same_voice_across_windows_keeps_one_global_id(self):
+        voice = _voice(1.0)
+        gallery = SpeakerGallery(FakeEmbedder({voice.tobytes(): [1.0, 0.0, 0.0]}))
+        audio_of = lambda seg: voice  # noqa: E731
+
+        gallery.assign([_seg(0.0, 1.0, "S01", 0)], audio_of)
+        assignments = gallery.assign([_seg(20.0, 21.0, "S01", 1)], audio_of)
+
+        self.assertEqual(assignments[0].speaker_id, "S01")
+        self.assertEqual(len(gallery.speakers()), 1)
+
+    def test_different_voice_gets_a_new_global_id(self):
+        first = _voice(1.0)
+        second = _voice(2.0)
+        embedder = FakeEmbedder(
+            {first.tobytes(): [1.0, 0.0, 0.0], second.tobytes(): [0.0, 1.0, 0.0]}
+        )
+        gallery = SpeakerGallery(embedder)
+
+        gallery.assign([_seg(0.0, 1.0, "S01", 0)], lambda seg: first)
+        assignments = gallery.assign([_seg(20.0, 21.0, "S01", 1)], lambda seg: second)
+
+        self.assertEqual(assignments[0].speaker_id, "S02")
+        self.assertEqual(len(gallery.speakers()), 2)
+
+    def test_local_labels_are_only_a_within_window_prior(self):
+        """同一窗口里两个局部标签若声纹相同，应归到同一个全局说话人。"""
+        voice = _voice(1.0)
+        gallery = SpeakerGallery(FakeEmbedder({voice.tobytes(): [1.0, 0.0, 0.0]}))
+        audio_of = lambda seg: voice  # noqa: E731
+
+        assignments = gallery.assign(
+            [_seg(0.0, 1.0, "S01", 0), _seg(2.0, 3.0, "S02", 0)], audio_of
+        )
+
+        self.assertEqual([a.speaker_id for a in assignments], ["S01", "S01"])
+
+    def test_group_members_inherit_the_group_decision(self):
+        """同窗口同局部标签的段落共享一次判定，包括太短而拿不到声纹的那段。"""
+        # 两段都超过 min_segment_sec=0.1 的门槛（1600 样本），但 long_voice 更长，
+        # 所以组代表是它；short_voice 的字节不在向量表里，一旦被选为组代表就会
+        # 拿到 None，测试随即暴露选择逻辑写反了。
+        long_voice = _voice(1.0, samples=2000)
+        short_voice = _voice(2.0, samples=1700)
+        gallery = SpeakerGallery(
+            FakeEmbedder({long_voice.tobytes(): [1.0, 0.0, 0.0]}, default=None),
+            min_segment_sec=0.1,
+        )
+
+        def audio_of(seg):
+            return long_voice if seg.text == "long" else short_voice
+
+        assignments = gallery.assign(
+            [
+                _seg(0.0, 5.0, "S03", 0, text="long"),
+                _seg(6.0, 6.02, "S03", 0, text="short"),
+            ],
+            audio_of,
+        )
+
+        self.assertEqual([a.speaker_id for a in assignments], ["S01", "S01"])
+
+    def test_unembeddable_group_is_marked_unconfident(self):
+        gallery = SpeakerGallery(FakeEmbedder({}), min_segment_sec=0.1)
+
+        assignments = gallery.assign([_seg(0.0, 5.0, "S01", 0)], lambda seg: _voice(9.0))
+
+        self.assertEqual(assignments[0].speaker_id, UNKNOWN_SPEAKER_ID)
+        self.assertFalse(assignments[0].confident)
+
+    def test_too_short_segment_is_not_embedded(self):
+        # 100 样本远低于 min_segment_sec=1.0 对应的 16000 样本门槛
+        voice = _voice(1.0, samples=100)
+        gallery = SpeakerGallery(FakeEmbedder({voice.tobytes(): [1.0, 0.0, 0.0]}), min_segment_sec=1.0)
+
+        assignments = gallery.assign([_seg(0.0, 0.2, "S01", 0)], lambda seg: voice)
+
+        self.assertFalse(assignments[0].confident)
+
+    def test_unknown_speaker_appears_in_the_roster(self):
+        gallery = SpeakerGallery(FakeEmbedder({}), min_segment_sec=0.1)
+
+        gallery.assign([_seg(0.0, 5.0, "S01", 0)], lambda seg: _voice(9.0))
+
+        roster = {item["id"]: item for item in gallery.speakers()}
+        self.assertIn(UNKNOWN_SPEAKER_ID, roster)
+
+    def test_rename_and_display_name(self):
+        voice = _voice(1.0)
+        gallery = SpeakerGallery(FakeEmbedder({voice.tobytes(): [1.0, 0.0, 0.0]}))
+        gallery.assign([_seg(0.0, 1.0, "S01", 0)], lambda seg: voice)
+
+        self.assertEqual(gallery.display_name("S01"), "S01")
+        gallery.rename("S01", "张总")
+        self.assertEqual(gallery.display_name("S01"), "张总")
+
+    def test_rename_unknown_speaker_raises(self):
+        gallery = SpeakerGallery(None)
+
+        with self.assertRaises(KeyError):
+            gallery.rename("S99", "谁")
+
+    def test_centroid_update_keeps_a_consistent_voice_matched(self):
+        """质心按样本数滑动平均更新，同一嗓音重复出现不应分裂出新的说话人。"""
+        voice = _voice(1.0)
+        gallery = SpeakerGallery(FakeEmbedder({voice.tobytes(): [1.0, 0.0, 0.0]}))
+        audio_of = lambda seg: voice  # noqa: E731
+
+        for index in range(5):
+            assignments = gallery.assign([_seg(float(index) * 10, float(index) * 10 + 1, "S01", index)], audio_of)
+            self.assertEqual(assignments[0].speaker_id, "S01")
+
+        roster = gallery.speakers()
+        self.assertEqual(len(roster), 1)
+        self.assertEqual(roster[0]["samples"], 5)
+
+    def test_empty_input_returns_empty(self):
+        gallery = SpeakerGallery(None)
+
+        self.assertEqual(gallery.assign([], lambda seg: None), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
