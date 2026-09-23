@@ -864,7 +864,13 @@ class WindowPolicy:
         if last_run_sec is None:
             if total_seconds < self.min_first_window:
                 return WindowDecision(False)
-        elif total_seconds - last_run_sec < self.hop:
+            # 首次运行的左边界恒为 0，**不能**套用下面那条统一公式：当
+            # min_first_window > window 时，统一公式算出的左边界会落在 0 之后，
+            # 而后续窗口都是 [t - window, t]，永远够不到开头——于是
+            # [0, total_seconds - window) 这段音频不会被任何一次推理覆盖，被静默
+            # 丢弃。转写看起来一切正常，只是开头少了内容，下游没有任何东西能发现。
+            return WindowDecision(True, start_sec=0.0, end_sec=float(total_seconds))
+        if total_seconds - last_run_sec < self.hop:
             return WindowDecision(False)
         return WindowDecision(
             True,

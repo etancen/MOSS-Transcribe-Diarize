@@ -116,12 +116,18 @@ class WindowPolicy:
 
 规则：
 
-- 首次运行：`total_seconds >= min_first_window`（默认 8.0）
-- 后续运行：`total_seconds - last_run_sec >= hop`（默认 5.0）
-- 决策成立时：`end_sec = total_seconds`，`start_sec = max(0.0, total_seconds - window)`
+- 首次运行：`total_seconds >= min_first_window`（默认 8.0）时触发
+- 后续运行：`total_seconds - last_run_sec >= hop`（默认 5.0）时触发
+- 决策成立时 `end_sec = total_seconds`；`start_sec` 分两种：
+  - **首次运行恒为 0**
+  - 后续运行为 `max(0.0, total_seconds - window)`
 - 决策不成立时：`should_run=False`，`start_sec`/`end_sec` 无意义
 
 首次运行不等满 `W` 秒，是为了避免开场 20 秒一片空白。窗口短一些对模型输出质量影响有限，而且首个窗口左边界没有更早的音频，本来也不需要左侧上下文。
+
+**首次运行的 `start_sec` 必须是 0，不能套用后续运行那条公式。** 若统一用 `max(0.0, total_seconds - window)`，当 `min_first_window > window` 时首次窗口的左边界会落在 0 之后；而后续窗口都是 `[t - window, t]`，永远够不到开头。于是 `[0, total_seconds - window)` 这段音频不会被任何一次推理覆盖，被**静默丢弃**——转写看起来一切正常，只是开头少了内容，下游没有任何东西能发现。
+
+这条约束的代价：首次窗口可能长达 `min_first_window` 秒，超过 `window`。会话的输出 token 预算按 `window` 推算，所以当 `min_first_window` 明显大于 `window` 时首个窗口的预算会偏紧。默认配置（8.0 < 20.0）下两者一致，不受影响。
 
 ### 4.3 `realtime/stitch.py` — `Stitcher`
 
