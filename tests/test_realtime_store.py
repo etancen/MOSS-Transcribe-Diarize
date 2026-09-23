@@ -59,7 +59,7 @@ class SessionStoreTest(unittest.TestCase):
         audio = np.linspace(-0.5, 0.5, 16000, dtype=np.float32)
         store.append_audio(audio)
 
-        store.finalize([], [])
+        store.finalize([])
 
         written, rate = sf.read(str(store.audio_path), dtype="float32")
         self.assertEqual(rate, 16000)
@@ -70,7 +70,7 @@ class SessionStoreTest(unittest.TestCase):
         store.append_audio(np.zeros(800, dtype=np.float32))
         store.append_audio(np.zeros(400, dtype=np.float32))
 
-        store.finalize([], [])
+        store.finalize([])
 
         written, _ = sf.read(str(store.audio_path), dtype="float32")
         self.assertEqual(written.shape, (1200,))
@@ -79,13 +79,13 @@ class SessionStoreTest(unittest.TestCase):
         store = self._store(record_audio=False)
         store.append_audio(np.zeros(800, dtype=np.float32))
 
-        store.finalize([], [])
+        store.finalize([])
 
         self.assertFalse(store.audio_path.exists())
 
     def test_append_after_finalize_is_ignored(self):
         store = self._store()
-        store.finalize([], [])
+        store.finalize([])
 
         store.append_audio(np.zeros(800, dtype=np.float32))
 
@@ -122,7 +122,7 @@ class SessionStoreTest(unittest.TestCase):
 
     def test_finalize_records_speakers_and_end_time(self):
         store = self._store()
-        store.finalize([], [{"id": "S01", "name": "张总", "samples": 3}], status="done")
+        store.finalize([{"id": "S01", "name": "张总", "samples": 3}], status="done")
 
         meta = json.loads(store.meta_path.read_text(encoding="utf-8"))
         self.assertEqual(meta["status"], "done")
@@ -131,9 +131,9 @@ class SessionStoreTest(unittest.TestCase):
 
     def test_finalize_is_idempotent(self):
         store = self._store()
-        store.finalize([], [], status="done")
+        store.finalize([], status="done")
 
-        store.finalize([], [], status="failed")
+        store.finalize([], status="failed")
 
         meta = json.loads(store.meta_path.read_text(encoding="utf-8"))
         self.assertEqual(meta["status"], "done")

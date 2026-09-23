@@ -95,7 +95,6 @@ class SessionStore:
 
     def finalize(
         self,
-        committed: Iterable[Any],
         speakers: Iterable[dict],
         *,
         status: str = "done",
