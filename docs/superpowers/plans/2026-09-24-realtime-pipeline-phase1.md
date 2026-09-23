@@ -668,12 +668,20 @@ class AudioRingBuffer:
 
     def append(self, pcm: np.ndarray) -> None:
         arr = np.asarray(pcm, dtype=np.float32).reshape(-1)
-        if arr.size == 0:
+        received = int(arr.size)
+        if received == 0:
             return
-        if arr.size >= self._capacity:
+        if received >= self._capacity:
             arr = arr[-self._capacity :]
         with self._lock:
-            count = arr.size
+            # 写入位置按**截断后**的长度算（超出容量的那部分本来就不该被写），
+            # 但 _total 必须按**收到的**样本数推进。
+            #
+            # 这一步是本实现最容易写错的地方：如果拿截断后的 count 去推进 _total，
+            # _total 就永远长不过 capacity，于是"已淘汰的头部"恒为 0，slice 永远不会
+            # 返回 None——它会静默返回错位的样本，而下游所有时间戳跟着错，且没有任何
+            # 东西会发现。_total 是会话时钟，不是保留量。
+            count = int(arr.size)
             end = self._write + count
             if end <= self._capacity:
                 self._data[self._write : end] = arr
@@ -682,7 +690,7 @@ class AudioRingBuffer:
                 self._data[self._write :] = arr[:head]
                 self._data[: end - self._capacity] = arr[head:]
             self._write = end % self._capacity
-            self._total += count
+            self._total += received
 
     def slice(self, start_sec: float, end_sec: float) -> np.ndarray | None:
         """返回 ``[start_sec, end_sec)`` 的音频，区间已被淘汰时返回 ``None``。"""
