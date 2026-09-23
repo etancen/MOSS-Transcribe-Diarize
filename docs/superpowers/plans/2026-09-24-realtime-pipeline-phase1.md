@@ -2085,7 +2085,7 @@ git commit -m "feat(realtime): add WindowTranscriber protocol and HF window back
   - `.append_committed(segments) -> None`
   - `.write_provisional(segments) -> None`
   - `.write_meta(**fields) -> None`
-  - `.finalize(committed, speakers, *, status="done") -> None`
+  - `.finalize(speakers, *, status="done") -> None`
   - `SessionStore.list_sessions(runs_dir) -> list[dict]`
   - `SessionStore.session_dir(runs_dir, session_id) -> Path`
   - `SessionStore.load_committed(runs_dir, session_id) -> list[dict]`
@@ -2158,7 +2158,7 @@ class SessionStoreTest(unittest.TestCase):
         audio = np.linspace(-0.5, 0.5, 16000, dtype=np.float32)
         store.append_audio(audio)
 
-        store.finalize([], [])
+        store.finalize([])
 
         written, rate = sf.read(str(store.audio_path), dtype="float32")
         self.assertEqual(rate, 16000)
@@ -2169,7 +2169,7 @@ class SessionStoreTest(unittest.TestCase):
         store.append_audio(np.zeros(800, dtype=np.float32))
         store.append_audio(np.zeros(400, dtype=np.float32))
 
-        store.finalize([], [])
+        store.finalize([])
 
         written, _ = sf.read(str(store.audio_path), dtype="float32")
         self.assertEqual(written.shape, (1200,))
@@ -2178,13 +2178,13 @@ class SessionStoreTest(unittest.TestCase):
         store = self._store(record_audio=False)
         store.append_audio(np.zeros(800, dtype=np.float32))
 
-        store.finalize([], [])
+        store.finalize([])
 
         self.assertFalse(store.audio_path.exists())
 
     def test_append_after_finalize_is_ignored(self):
         store = self._store()
-        store.finalize([], [])
+        store.finalize([])
 
         store.append_audio(np.zeros(800, dtype=np.float32))
 
@@ -2221,7 +2221,7 @@ class SessionStoreTest(unittest.TestCase):
 
     def test_finalize_records_speakers_and_end_time(self):
         store = self._store()
-        store.finalize([], [{"id": "S01", "name": "张总", "samples": 3}], status="done")
+        store.finalize([{"id": "S01", "name": "张总", "samples": 3}], status="done")
 
         meta = json.loads(store.meta_path.read_text(encoding="utf-8"))
         self.assertEqual(meta["status"], "done")
@@ -2230,9 +2230,9 @@ class SessionStoreTest(unittest.TestCase):
 
     def test_finalize_is_idempotent(self):
         store = self._store()
-        store.finalize([], [], status="done")
+        store.finalize([], status="done")
 
-        store.finalize([], [], status="failed")
+        store.finalize([], status="failed")
 
         meta = json.loads(store.meta_path.read_text(encoding="utf-8"))
         self.assertEqual(meta["status"], "done")
@@ -2383,11 +2383,13 @@ class SessionStore:
 
     def finalize(
         self,
-        committed: Iterable[Any],
         speakers: Iterable[dict],
         *,
         status: str = "done",
     ) -> None:
+        # 刻意**不**接收 committed 段落：它们由 append_committed 在每个窗口追加（这样
+        # 会话中途崩溃也能保住已产出的内容），本方法只负责收尾。若这里再写一遍调用方
+        # 传进来的段落，每次会话结束时整个转写都会重复一遍。
         if self._closed:
             return
         self._closed = True
@@ -2976,7 +2978,7 @@ class RealtimeSession:
             events.append({"type": "provisional", "segments": []})
         events.append({"type": "speaker", "speakers": self._gallery.speakers()})
         self._closed = True
-        self._store.finalize(self._committed, self._gallery.speakers())
+        self._store.finalize(self._gallery.speakers())
         return events
 
     # --- 内部 ---
