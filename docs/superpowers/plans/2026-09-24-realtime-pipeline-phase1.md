@@ -667,30 +667,35 @@ class AudioRingBuffer:
             return min(self._total, self._capacity) / self._sample_rate
 
     def append(self, pcm: np.ndarray) -> None:
+        """追加任意长度的音频；超出容量的最旧样本被丢弃。
+
+        ``self._write`` 恒等于 ``self._total % self._capacity``，因此从它开始按
+        逻辑顺序写入就维持了「逻辑索引 i 存放在物理位置 i % capacity」这一不变量
+        ——即便单次追加超过容量、需要多圈回绕也一样。
+
+        这里有两个数容易搞混，写错任何一个都会让 slice 静默返回错位样本（下游每个
+        时间戳跟着错，且没有任何东西会发现）：
+          - ``_total`` 按**收到的**样本数推进。它是会话时钟，不是保留量。若按截断后
+            的长度推进，``_total`` 永远长不过 capacity，"已淘汰的头部"恒为 0，
+            ``slice`` 就永远不会返回 ``None``。
+          - 写入位置按**实际落盘的**长度走，且每一圈都要取模，不能拿
+            ``_write + 收到的长度`` 直接当结束位置——超出 capacity 时那样会越界。
+        把 ``_write`` 从 ``_total`` 派生（而不是自己累加）让不变量只有一个来源。
+        """
         arr = np.asarray(pcm, dtype=np.float32).reshape(-1)
-        received = int(arr.size)
-        if received == 0:
+        count = arr.size
+        if count == 0:
             return
-        if received >= self._capacity:
-            arr = arr[-self._capacity :]
         with self._lock:
-            # 写入位置按**截断后**的长度算（超出容量的那部分本来就不该被写），
-            # 但 _total 必须按**收到的**样本数推进。
-            #
-            # 这一步是本实现最容易写错的地方：如果拿截断后的 count 去推进 _total，
-            # _total 就永远长不过 capacity，于是"已淘汰的头部"恒为 0，slice 永远不会
-            # 返回 None——它会静默返回错位的样本，而下游所有时间戳跟着错，且没有任何
-            # 东西会发现。_total 是会话时钟，不是保留量。
-            count = int(arr.size)
-            end = self._write + count
-            if end <= self._capacity:
-                self._data[self._write : end] = arr
-            else:
-                head = self._capacity - self._write
-                self._data[self._write :] = arr[:head]
-                self._data[: end - self._capacity] = arr[head:]
-            self._write = end % self._capacity
-            self._total += received
+            position = self._write
+            written = 0
+            while written < count:
+                chunk = min(count - written, self._capacity - position)
+                self._data[position : position + chunk] = arr[written : written + chunk]
+                written += chunk
+                position = (position + chunk) % self._capacity
+            self._total += count
+            self._write = self._total % self._capacity
 
     def slice(self, start_sec: float, end_sec: float) -> np.ndarray | None:
         """返回 ``[start_sec, end_sec)`` 的音频，区间已被淘汰时返回 ``None``。"""
