@@ -3473,3 +3473,13 @@ PY
 - **阶段三：浏览器前端** —— AudioWorklet 采集与混音、页面渲染与交互、i18n、README 与真机端到端调参。
 
 阶段一末尾的 `python - <<'PY'` 手工验证脚本是阶段二 `scripts/realtime_client.py` 的雏形。
+
+### 阶段二必须接上的三件事
+
+都源于阶段一的最终整分支审查——**漏掉任何一条都会产生静默错误**（程序照跑、测试照绿、结果错）：
+
+1. **把 `config.effective_max_new_tokens()` 传给转写器。** 阶段一里这个方法**没有任何消费者**，而 `HfWindowTranscriber` 把同一个数硬编码了第二份（`max_new_tokens=1020` = 20×51）。用户用 `--window 40` 时 config 算 2040、HF 后端仍用 1020，**输出被静默截断**。
+2. **`session_id` 在拼进路径之前必须校验。** `SessionStore.session_dir` 与 `__init__` 现在都会校验（并显式拒绝 `.`、`..`），但阶段二的 `GET /api/sessions/{id}` 会把 URL 段直接传进来，传输层必须再校验一次——否则是路径穿越。
+3. **驱动循环必须"先 await 完 `run_pending` 再 `close()`"。** 二者并发会让两个窗口落在两个 executor 线程里并改 `Stitcher` 的水位线、`SpeakerGallery` 的表、段落计数器与 `SessionStore`，后果是重复定稿或临时区错乱，**不会报错**。
+
+另有两件只有阶段二才能回答的事：`--no-silence-gate` 开关（阶段一里门控无法关闭，而且它的丢失上界是阶段一才加的）；以及 spec §11 列出的实测风险——`rtf` 是否真的小于 1、声纹在真实会议音频上的误合并率。

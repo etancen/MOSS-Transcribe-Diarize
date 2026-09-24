@@ -197,7 +197,7 @@ class SpeakerGallery:
     def __init__(self, embedder: SpeakerEmbedder | None, *, threshold: float = 0.55,
                  min_segment_sec: float = 0.4): ...
     def assign(self, segments: list[Segment], audio_of: Callable[[Segment], np.ndarray | None]
-               ) -> list[tuple[Segment, str]]: ...
+               ) -> list[Assignment]: ...
     def rename(self, global_id: str, name: str) -> None: ...
     def speakers(self) -> list[dict]: ...
 ```
@@ -239,6 +239,8 @@ class HfWindowTranscriber:
 
 参数映射：`max_new_tokens` 按 `W` 缩放（默认 `W=20` 时约 1020），`decoding="greedy"`（实时场景要确定性），`temperature=0`。
 
+**接线要求（阶段二必须做）**：`RealtimeConfig.effective_max_new_tokens()` 就是上面这个数（`max(256, round(window * 51))`），但阶段一里它**没有消费者**——`WindowTranscriber` 协议是 `transcribe_window(audio, *, prompt)`，不传预算，预算是构造转写器时固定的，而构造者是阶段二的 CLI。与此同时 `HfWindowTranscriber` 把同一个数硬编码了第二份（`max_new_tokens=1020`）。**CLI 必须把 `config.effective_max_new_tokens()` 传给转写器**，否则用户用 `--window 40` 时 config 算 2040、HF 后端仍用 1020，**输出被静默截断**。
+
 选择临时文件而非内存直传，是为了让两个后端共用同一条数据通路、且不改动 `ModelRunner`。写一帧不到 1 MB 的代价相对模型推理可以忽略；若后续 profiling 显示不是，再单独做内存直传优化。
 
 ### 4.6 `realtime/store.py` — `SessionStore`
@@ -261,17 +263,28 @@ runs/realtime/<session-id>/
 
 ```python
 class RealtimeSession:
-    def __init__(self, config: RealtimeConfig, store: SessionStore,
-                 transcriber: WindowTranscriber, embedder: SpeakerEmbedder | None): ...
-    def push_audio(self, pcm: np.ndarray) -> None: ...
-    async def run_pending(self) -> list[Event]: ...
-    def close(self) -> list[Event]: ...
+    def __init__(self, config: RealtimeConfig, *, transcriber: WindowTranscriber,
+                 store: SessionStore, embedder: SpeakerEmbedder | None = None,
+                 prompt: str = DEFAULT_PROMPT): ...
+    def push_audio(self, pcm: np.ndarray) -> None: ...      # 同步
+    async def run_pending(self) -> list[dict]: ...
+    async def close(self) -> list[dict]: ...
 ```
+
+事件是 `dict`（形状见 4.9），不是自定义类型。
+
+**调用契约**：`run_pending` 与 `close` 都是异步的，且**两者不得并发**——驱动方必须先 await 完 `run_pending` 再调 `close`。若让它们同时在途（例如把 `run_pending` 当 task 起、不 await 就 `close()`），两个窗口会落在两个 executor 线程里并改 `Stitcher` 的水位线、`SpeakerGallery` 的表、段落计数器与 `SessionStore`，后果是重复定稿或临时区错乱，**不会报错**。不把"在 `close()` 开头检查 `_window_running`"当作修法：那会让 `close()` 直接返回空、store 永不收尾、尾部全丢，比现状更糟。
 
 `run_pending` 每隔 0.5 秒由后台任务调用：
 
 1. 问 `WindowPolicy.decide`。不跑就返回空。
-2. **静音门控**：对窗口算 20ms 帧的 RMS，若高于 -45 dBFS 的帧占比 < 5%，判定为静音——**跳过推理但推进 `last_run_sec`**。会议里大量时间是静音，这道门控直接把实际算力开销砍下来，是成本上最划算的一个开关（可用 `--no-silence-gate` 关闭）。
+2. **静音门控**：对窗口算 20ms 帧的 RMS，若高于 -45 dBFS 的帧占比 < 5%，判定为静音——**跳过推理但推进 `last_run_sec`**。会议里大量时间是静音，这道门控直接把实际算力开销砍下来，是成本上最划算的一个开关（可用 `--no-silence-gate` 关闭——该开关属阶段二的 CLI，阶段一里无法关闭）。
+
+   **这道门控有代价，实现必须给它设上界。** 判据是"整窗活跃帧占比 < 5%"，20 秒窗口要越过门限需要约 1 秒以上的有声内容。设想"每 15 秒说半秒"的场合（安静演示、旁听、只答"嗯/对"）：覆盖该句的**每个**窗口活跃占比都在 2.5% 上下，于是**每个**都被跳过；而缓冲一旦过去超过 `window` 秒，后续窗口的左边界就移到它之上、**再也覆盖不到**——这不是别的失败路径那种"被下一个窗口重新覆盖"，是**永久丢失**。
+
+   因此实现必须满足：**若门控会让音频在下次真正运行之前变得不可达（距上次真正运行已达 `window` 秒），则强制运行一次**。这把永久丢失换成有界延迟，代价是持续静音期间每 `window` 秒一次运行，而非零次。同时 `status` 事件要报告被门控跳过的窗口数，使跳过**可观测**——否则全程 `state: "running"`，与健康会话无法区分，用户无从知道自己的会议被跳过过。
+
+   `silence_frame_ratio` 的默认值（0.05）本身是产品取舍：调低它减少跳过、增加算力。默认值下"不足 1 秒的孤立发声"仍可能被单窗判为静音，上界只保证它最迟 `window` 秒后被一次推理覆盖。
 3. 取窗口音频，`loop.run_in_executor` 里跑转写（阻塞的 HTTP 和文件 IO 不能占住事件循环）。
 4. 已有窗口在跑时跳过本次，不改 `last_run_sec`；下一次循环再判断。模型是瓶颈，堆队列只会让延迟持续增长。
 5. `Stitcher.ingest` 切分定稿和临时。
@@ -281,7 +294,7 @@ class RealtimeSession:
 兜底与降级：
 
 - 单次窗口推理抛异常：记 `error` 事件，不终止会话，`last_run_sec` 照常推进，下次重试。
-- 连续失败超过 3 次：发 `status` 事件把会话标为 `degraded`，前端显性提示。
+- 连续失败达到 `max_consecutive_failures`（默认 3）次：发 `status` 事件把会话标为 `degraded`，前端显性提示。成功一次即复位。
 - 落后超过 `3 * W`：发 `status` 事件报告积压，前端提示"算力跟不上"。
 
 ### 4.8 `app/realtime_server.py` — FastAPI 应用
@@ -326,7 +339,7 @@ JSON 事件（服务端 → 客户端）：
 {"type": "session", "session_id": "...", "started_at": ..., "config": {...}}
 
 {"type": "provisional", "segments": [
-  {"start": 41.2, "end": 43.8, "speaker": "S03", "text": "那么我们下周", "speaker_confident": true}
+  {"start": 41.2, "end": 43.8, "speaker": "S03", "text": "那么我们下周"}
 ]}
 
 {"type": "committed", "segments": [
