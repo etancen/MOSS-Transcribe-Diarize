@@ -150,5 +150,8 @@
   "errors.retranscribe_failed": "The re-run failed.",
   "errors.audio_missing": "This session has no recording.",
   "errors.session_not_found": "No such session.",
-  "errors.invalid_format": "Unsupported export format."
+  "errors.invalid_format": "Unsupported export format.",
+  "realtime.runtime.checking": "Checking",
+  "realtime.runtime.available": "Service ready",
+  "realtime.runtime.unavailable": "Service API unreachable"
 }

@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Iterator
@@ -31,6 +32,22 @@ def _connection_closed() -> tuple[type[BaseException], ...]:
     except ImportError:
         return ()
     return (ConnectionClosed,)
+
+
+def _make_output_robust() -> None:
+    """输出是中文，而控制台编码跟着区域设置走（英文 Windows 是 cp1252）。
+
+    不处理的话，第一条中文事件就会让整个客户端抛 UnicodeEncodeError——刚好在"连上了、
+    开始收事件"的那一刻。降级成替换字符：字可能缺几个，程序不能因为一行提示就断。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (ValueError, OSError):
+            pass
 
 
 def wav_to_pcm16k(path: str | Path, target_rate: int = 16000) -> np.ndarray:
@@ -139,6 +156,7 @@ async def run(url: str, wav_path: Path, *, realtime: bool = True, rate: int = 16
 
 
 def main(argv: list[str] | None = None) -> int:
+    _make_output_robust()
     parser = argparse.ArgumentParser(prog="realtime_client")
     parser.add_argument("wav", type=Path, help="要推的音频文件")
     parser.add_argument("--url", default="ws://127.0.0.1:7870/ws/realtime")

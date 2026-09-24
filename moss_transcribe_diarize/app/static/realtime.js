@@ -101,11 +101,11 @@ const state = {
   follow: true,
   sending: false,
   paused: false,
+  phase: "idle",
   droppedFrames: 0,
   clockTimer: null,
   startedAt: 0,
   audio: null,
-  levels: null,
   lastStatus: null,
 };
 
@@ -133,10 +133,24 @@ function notice(key, params) {
   notice.timer = window.setTimeout(() => { dom.notice.hidden = true; }, 8000);
 }
 
-function setState(label, tone = "") {
+const STATE_MESSAGES = {
+  idle: "realtime.status.idle",
+  connecting: "realtime.status.connecting",
+  live: "realtime.status.live",
+  stopped: "realtime.status.stopped",
+};
+
+/**
+ * 状态标签只由**逻辑状态**渲染。
+ *
+ * 不能各处各自 `t(...)` 一句话塞进去：切语言时要把当前状态重新翻译一遍，而"当前是
+ * 什么状态"与"那句话怎么翻译"是两件事——分开之后，切语言不会再覆盖掉会话的真实状态。
+ */
+function setPhase(phase) {
+  state.phase = phase;
   if (!dom.statePill) return;
-  dom.statePill.textContent = label;
-  dom.statePill.dataset.tone = tone;
+  dom.statePill.textContent = t(STATE_MESSAGES[phase] || STATE_MESSAGES.idle);
+  dom.statePill.dataset.tone = phase === "live" ? "good" : "";
 }
 
 // ---------------------------------------------------------------- 渲染
@@ -245,7 +259,6 @@ function renderProvisional() {
 function renderRoster() {
   renderCommitted();
 }
-
 function renderStats() {
   const status = state.lastStatus;
   if (dom.statRtf) dom.statRtf.textContent = status ? status.rtf.toFixed(2) : "—";
@@ -264,7 +277,7 @@ function handleEvent(event) {
       state.sessionId = event.session_id;
       if (dom.sessionId) dom.sessionId.textContent = event.session_id;
       dom.exportBar.hidden = false;
-      setState(t("realtime.status.live"), "good");
+      setPhase("live");
       break;
     case "committed":
       state.committed = mergeCommitted(state.committed, event.segments);
@@ -276,7 +289,12 @@ function handleEvent(event) {
       break;
     case "speaker":
       state.roster = new Map((event.speakers || []).map((item) => [item.id, item.name || item.id]));
-      renderRoster();
+      // 连数据一起改写，不只是重画：`committed` 里的旧名字是定稿那一刻冻结的，而
+      // 说话人表是**当下**的。只改视图的话，两份状态会一直不一致。
+      for (const [id, name] of state.roster) {
+        state.committed = applyRename(state.committed, id, name);
+      }
+      renderCommitted();
       break;
     case "status":
       state.lastStatus = event;
@@ -338,6 +356,11 @@ async function ensureAudio() {
   }
   if (context.sampleRate !== TARGET_RATE) resampled = true;
   if (resampled) notice("realtime.notice.resampled", { rate: context.sampleRate });
+  // 浏览器的自动播放策略会让新建的 AudioContext 停在 suspended，那样音频线程不渲染、
+  // 一帧都出不来。这个调用点就在"开始"按钮的点击里，所以 resume 一定被允许。
+  if (context.state === "suspended") {
+    try { await context.resume(); } catch (err) { /* 没有用户手势时会被拒，让用户再点一次 */ }
+  }
 
   await context.audioWorklet.addModule("/assets/audio-worklet.js?in=" + context.sampleRate);
   const node = new AudioWorkletNode(context, "mtd-capture", {
@@ -451,7 +474,7 @@ function openSocket() {
   const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
   const socket = new WebSocket(`${scheme}//${window.location.host}${WS_PATH}`);
   socket.binaryType = "arraybuffer";
-  socket.addEventListener("open", () => setState(t("realtime.status.connecting")));
+  socket.addEventListener("open", () => setPhase("connecting"));
   socket.addEventListener("message", (message) => {
     if (typeof message.data !== "string") return;
     try {
@@ -464,7 +487,7 @@ function openSocket() {
     state.socket = null;
     state.sending = false;
     state.paused = false;
-    setState(t("realtime.status.stopped"));
+    setPhase("stopped");
     dom.startButton.disabled = false;
     dom.pauseButton.disabled = true;
     dom.stopButton.disabled = true;
@@ -605,7 +628,7 @@ async function loadRuntime() {
   try {
     const payload = await (await fetch("/api/runtime")).json();
     if (dom.runtime) {
-      dom.runtime.textContent = t("runtime.available");
+      dom.runtime.textContent = t("realtime.runtime.available");
       dom.runtime.dataset.tone = "good";
     }
     if (dom.backendInfo) {
@@ -623,7 +646,7 @@ async function loadRuntime() {
     }
   } catch (err) {
     if (dom.runtime) {
-      dom.runtime.textContent = t("runtime.unavailable");
+      dom.runtime.textContent = t("realtime.runtime.unavailable");
       dom.runtime.dataset.tone = "bad";
     }
   }
@@ -656,8 +679,7 @@ function wire() {
     await setLocale(event.target.value);
     renderCommitted();
     renderProvisional();
-    setState(state.sending ? t("realtime.status.live") : t("realtime.status.idle"),
-             state.sending ? "good" : "");
+    setPhase(state.phase);
   });
 }
 
@@ -668,7 +690,7 @@ async function main() {
   if (dom.localeSelect) dom.localeSelect.value = getLocale();
   wire();
   await loadRuntime();
-  setState(t("realtime.status.idle"));
+  setPhase("idle");
   dom.pauseButton.disabled = true;
   dom.stopButton.disabled = true;
   window.addEventListener("beforeunload", killAudio);
@@ -679,6 +701,7 @@ window.mtdRealtime = {
   feed(events) {
     for (const event of events) handleEvent(event);
   },
+  reloadRuntime: loadRuntime,
   helpers: { formatClock, speakerColor, speakerIndex, mergeCommitted, applyRename, shouldFollow },
   state: () => ({
     sessionId: state.sessionId,

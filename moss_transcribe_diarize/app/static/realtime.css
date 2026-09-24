@@ -207,6 +207,11 @@ button.source.muted { opacity: 0.5; text-decoration: line-through; }
 
 .export-bar { display: flex; align-items: center; gap: 8px; }
 
+/* `display: flex` 会压过浏览器对 [hidden] 的默认 `display: none`，所以显式补回来——
+   否则加载时抽屉和导出栏就已经摊在页面上了。 */
+.export-bar[hidden],
+.drawer[hidden] { display: none; }
+
 .drawer {
   position: fixed;
   top: 56px;

@@ -1,0 +1,15 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "mtd-realtime",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": [
+        "scripts/realtime_dev_server.py",
+        "--port",
+        "7871"
+      ],
+      "port": 7871
+    }
+  ]
+}

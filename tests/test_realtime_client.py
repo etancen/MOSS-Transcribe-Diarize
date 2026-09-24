@@ -199,5 +199,25 @@ class TeardownEventsAreDeliveredTest(unittest.TestCase):
         self.assertEqual(stats["committed"], 1)
 
 
+class NonUtf8ConsoleTest(unittest.TestCase):
+    """输出的每一行都是中文，而英文 Windows 的控制台是 cp1252。"""
+
+    def test_help_survives_a_non_utf8_stdout(self):
+        import os
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        repo = Path(__file__).resolve().parents[1]
+        env = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+        result = subprocess.run(
+            [sys.executable, "scripts/realtime_client.py", "--help"],
+            capture_output=True, text=True, env=env, cwd=repo,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("UnicodeEncodeError", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
