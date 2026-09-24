@@ -48,7 +48,7 @@ class _Row:
         }
 
 
-def _app(tmp: Path, *, embedder=None, probe=None, **config_kwargs):
+def _app(tmp: Path, *, embedder=None, probe=None, record_audio=True, **config_kwargs):
     from moss_transcribe_diarize.app.realtime_server import create_realtime_app
 
     created: list[ScriptedTranscriber] = []
@@ -64,6 +64,7 @@ def _app(tmp: Path, *, embedder=None, probe=None, **config_kwargs):
         transcriber_factory=factory,
         embedder=embedder,
         probe=probe,
+        record_audio=record_audio,
         runs_dir=tmp / "runs",
     )
     app.state.created_transcribers = created
@@ -574,6 +575,36 @@ class CheckEndpointTest(unittest.TestCase):
 
         self.assertTrue(result["reachable"])
         self.assertEqual(seen, ["http://host:8000/v1/models"])
+
+
+class NoRecordTest(unittest.TestCase):
+    """``--no-record``：只留转写文本，不落盘会议录音（那是敏感数据）。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self._tmp.cleanup)
+        self.runs = Path(self._tmp.name) / "runs"
+        self.client = TestClient(
+            _app(Path(self._tmp.name), embedder=StubEmbedder(), record_audio=False)
+        )
+
+    def test_no_recording_is_written_but_the_transcript_is(self):
+        t = np.arange(int(9.0 * 16000), dtype=np.float32) / 16000
+        pcm = (0.3 * np.sin(2 * np.pi * 220 * t)).astype("<f4").tobytes()
+
+        with self.client.websocket_connect("/ws/realtime") as ws:
+            ws.send_json({"type": "start"})
+            session_id = ws.receive_json()["session_id"]
+            ws.send_bytes(pcm)
+            for _ in range(40):
+                if ws.receive_json()["type"] == "committed":
+                    break
+            ws.send_json({"type": "stop"})
+
+        self.assertFalse((self.runs / session_id / "audio.wav").exists())
+        self.assertTrue((self.runs / session_id / "transcript.jsonl").exists())
+        meta = SessionStore.load_meta(self.runs, session_id)
+        self.assertFalse(meta["record_audio"])
 
 
 if __name__ == "__main__":

@@ -98,6 +98,7 @@ def create_realtime_app(
     runs_dir: str | Path = "runs/realtime",
     static_dir: str | Path | None = None,
     probe: Callable[[], dict[str, Any]] | None = None,
+    record_audio: bool = True,
 ):
     try:
         from fastapi import FastAPI, HTTPException, Query
@@ -225,7 +226,8 @@ def create_realtime_app(
             if session is not None:
                 return                                          # 重复的 start：忽略，不另开会话
             prompt = _with_hotwords(str(source.get("prompt") or ""), source.get("hotwords")) or None
-            store = SessionStore(runs, name=str(source.get("session_name") or ""))
+            store = SessionStore(runs, name=str(source.get("session_name") or ""),
+                                 record_audio=record_audio)
             session = RealtimeSession(
                 config,
                 transcriber=transcriber_factory(),
