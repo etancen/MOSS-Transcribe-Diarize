@@ -141,6 +141,71 @@ def build_probe(args: argparse.Namespace) -> Callable[[], dict] | None:
     return probe
 
 
+def _budget_for_a_whole_recording(path: Path, config: RealtimeConfig, override: int | None) -> int:
+    """整段录音的输出预算。
+
+    与逐窗那条路同一个道理：**按实际音频长度推算**，不能按 ``window`` 定死。这里的
+    音频是一整场会议，按 window 定死会截掉绝大部分内容。
+    """
+    if override is not None:
+        return int(override)
+    import soundfile as sf
+
+    from moss_transcribe_diarize.realtime.transcriber import TOKENS_PER_AUDIO_SECOND
+
+    seconds = float(sf.info(str(path)).duration or 0.0)
+    return max(config.effective_max_new_tokens(), int(round(seconds * TOKENS_PER_AUDIO_SECOND)))
+
+
+def build_retranscriber(args: argparse.Namespace, config: RealtimeConfig) -> Callable[[Path, str], str]:
+    """``POST /api/sessions/{id}/retranscribe`` 的后端：整段录音跑一次文件模式。
+
+    ``--backend vllm`` 下就是一次普通的整文件请求，torch-free。``--backend hf`` 下的
+    ModelRunner **在第一次真的重跑时才构造**——它要占一份额外的显存，而多数人从不点
+    那个按钮。
+    """
+    if args.backend == "vllm":
+        from moss_transcribe_diarize.app.openai_audio_client import (
+            extract_transcription_text,
+            transcribe_bytes,
+        )
+        from moss_transcribe_diarize.prompts import DEFAULT_PROMPT
+
+        if not args.vllm_base_url:
+            raise SystemExit("--backend vllm 需要 --vllm-base-url（例如 http://127.0.0.1:8000）")
+
+        def retranscribe(path: Path, prompt: str) -> str:
+            response = transcribe_bytes(
+                base_url=args.vllm_base_url,
+                model=args.vllm_model or args.model,
+                prompt=prompt or DEFAULT_PROMPT,
+                file_bytes=Path(path).read_bytes(),
+                api_key=args.vllm_api_key,
+                timeout=1800.0,
+                max_new_tokens=_budget_for_a_whole_recording(path, config, args.max_new_tokens),
+            )
+            return extract_transcription_text(response)
+
+        return retranscribe
+
+    state: dict[str, Any] = {}
+
+    def retranscribe_hf(path: Path, prompt: str) -> str:
+        from moss_transcribe_diarize.app.model_runner import ModelRunner      # 只有这条路需要 torch
+        from moss_transcribe_diarize.prompts import DEFAULT_PROMPT
+
+        if "runner" not in state:
+            state["runner"] = ModelRunner(args.model, device=args.device, dtype=args.dtype)
+        result = state["runner"].transcribe(
+            path,
+            prompt=prompt or DEFAULT_PROMPT,
+            max_new_tokens=_budget_for_a_whole_recording(path, config, args.max_new_tokens),
+        )
+        return result.text
+
+    return retranscribe_hf
+
+
 def main(argv: list[str] | None = None) -> int:
     _make_output_robust()
     args = parse_args(argv)
@@ -157,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
         runs_dir=args.runs_dir,
         probe=build_probe(args),
         record_audio=args.record,
+        retranscribe=build_retranscriber(args, config),
     )
 
     print(LOOPBACK_WARNING)

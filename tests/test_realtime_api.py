@@ -48,7 +48,8 @@ class _Row:
         }
 
 
-def _app(tmp: Path, *, embedder=None, probe=None, record_audio=True, **config_kwargs):
+def _app(tmp: Path, *, embedder=None, probe=None, record_audio=True, retranscribe=None,
+         static_dir=None, **config_kwargs):
     from moss_transcribe_diarize.app.realtime_server import create_realtime_app
 
     created: list[ScriptedTranscriber] = []
@@ -65,6 +66,8 @@ def _app(tmp: Path, *, embedder=None, probe=None, record_audio=True, **config_kw
         embedder=embedder,
         probe=probe,
         record_audio=record_audio,
+        retranscribe=retranscribe,
+        static_dir=static_dir,
         runs_dir=tmp / "runs",
     )
     app.state.created_transcribers = created
@@ -605,6 +608,76 @@ class NoRecordTest(unittest.TestCase):
         self.assertTrue((self.runs / session_id / "transcript.jsonl").exists())
         meta = SessionStore.load_meta(self.runs, session_id)
         self.assertFalse(meta["record_audio"])
+
+
+class RetranscribeTest(unittest.TestCase):
+    """spec §4.8 / §5.2 的"重跑本次会话"：把整段录音交给当前后端跑一次文件模式。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self._tmp.cleanup)
+        self.runs = Path(self._tmp.name) / "runs"
+        store = SessionStore(self.runs, "s1", name="周会")
+        store.append_committed([_Row()])
+        store.append_audio(np.zeros(16000, dtype=np.float32))
+        store.finalize([])
+
+    def _client(self, retranscribe=None):
+        return TestClient(_app(Path(self._tmp.name), retranscribe=retranscribe))
+
+    def test_runs_the_whole_recording_through_the_injected_backend(self):
+        seen = []
+
+        def fake(path, prompt):
+            seen.append((Path(path).name, prompt))
+            return "[0.5][S01]重跑的结果[3.0]"
+
+        response = self._client(fake).post("/api/sessions/s1/retranscribe")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["text"], "[0.5][S01]重跑的结果[3.0]")
+        self.assertEqual(seen, [("audio.wav", "")])
+
+    def test_a_failing_backend_is_reported_with_its_reason(self):
+        def broken(path, prompt):
+            raise RuntimeError("vLLM 没起来")
+
+        response = self._client(broken).post("/api/sessions/s1/retranscribe")
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["code"], "retranscribe_failed")
+        self.assertIn("vLLM 没起来", response.json()["detail"])
+
+    def test_without_a_backend_it_says_so_instead_of_crashing(self):
+        response = self._client(None).post("/api/sessions/s1/retranscribe")
+
+        self.assertEqual(response.status_code, 501)
+        self.assertEqual(response.json()["code"], "retranscribe_unavailable")
+
+    def test_the_sessions_own_prompt_is_reused(self):
+        """重跑必须用实时那次用过的 prompt，否则重跑出来的内容与当场那次不是一回事。"""
+        SessionStore(self.runs, "s1", name="周会").write_meta(prompt="只转写中文")
+        seen = []
+
+        self._client(lambda path, prompt: seen.append(prompt) or "x").post(
+            "/api/sessions/s1/retranscribe"
+        )
+
+        self.assertEqual(seen, ["只转写中文"])
+
+    def test_unknown_session_is_404(self):
+        self.assertEqual(
+            self._client(lambda path, prompt: "x").post("/api/sessions/nope/retranscribe").status_code,
+            404,
+        )
+
+    def test_a_session_without_a_recording_is_404(self):
+        SessionStore(self.runs, "s2", name="没录音").finalize([])
+
+        response = self._client(lambda path, prompt: "x").post("/api/sessions/s2/retranscribe")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["code"], "audio_missing")
 
 
 if __name__ == "__main__":

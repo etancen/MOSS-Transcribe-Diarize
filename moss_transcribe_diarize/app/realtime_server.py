@@ -99,6 +99,7 @@ def create_realtime_app(
     static_dir: str | Path | None = None,
     probe: Callable[[], dict[str, Any]] | None = None,
     record_audio: bool = True,
+    retranscribe: Callable[[Path, str], str] | None = None,
 ):
     try:
         from fastapi import FastAPI, HTTPException, Query
@@ -187,6 +188,32 @@ def create_realtime_app(
             return error("invalid_format", str(exc), 400)
         return JSONResponse({"format": format, "text": text})
 
+    @app.post("/api/sessions/{session_id}/retranscribe")
+    def retranscribe_session(session_id: str):
+        """把整段录音交给当前后端重跑一次（spec §4.8 / §5.2 的"重跑本次会话"）。
+
+        走的是文件模式，与实时那条路共用同一个转写后端，只是不做分窗、不做流式。
+        实时路径为了不拖 torch 而注入 ``transcriber_factory``，这里同理注入
+        ``retranscribe``——所以本模块仍然不知道后端是什么，也就不需要 import torch。
+        """
+        if retranscribe is None:
+            return error(
+                "retranscribe_unavailable",
+                "this deployment cannot re-run a session: no file-mode backend was provided",
+                501,
+            )
+        meta = load_meta(session_id)
+        if not meta:
+            return error("session_not_found", f"no such session: {session_id}", 404)
+        path = SessionStore.session_dir(runs, session_id) / "audio.wav"
+        if not path.exists():
+            return error("audio_missing", "this session has no recording", 404)
+        try:
+            text = retranscribe(path, str(meta.get("prompt") or ""))
+        except Exception as exc:                                  # noqa: BLE001
+            return error("retranscribe_failed", f"{type(exc).__name__}: {exc}", 502)
+        return JSONResponse({"session_id": session_id, "text": text})
+
     @app.websocket("/ws/realtime")
     async def realtime_socket(websocket: WebSocket):
         from fastapi import WebSocketDisconnect
@@ -236,6 +263,9 @@ def create_realtime_app(
                 **({"prompt": prompt} if prompt else {}),
             )
             session_id = store.session_id
+            # 把 prompt 落到 session.json：spec §4.6 要求它在那里，而且"重跑本次会话"
+            # 要用同一个 prompt——不然重跑出来的内容与实时那次不是一回事。
+            store.write_meta(prompt=session.prompt)
             registry.add(session_id, session)
             for frame in pending:
                 session.push_audio(frame)
