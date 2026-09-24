@@ -158,12 +158,19 @@ class RealtimeSession:
             self.config.silence_rms_db,
             self.config.silence_frame_ratio,
         ):
-            # 门控只允许**推迟**一个窗口，绝不能让音频变得不可达。环形缓冲持续淘汰旧
-            # 音频，而每个窗口最多往回覆盖 window 秒：距上次真正跑过的窗口已满 window 秒
-            # 时，再跳过就会有音频永远落在任何后续窗口的左边界之外——那个位置不会再有
-            # 窗口覆盖它，丢失不可恢复。所以这里兜一道底：持续静音时约每 window 秒放行
-            # 一次（代价是几次推理），而不是一次都不跑。
-            if decision.end_sec - self._last_executed_end < self.config.window:
+            # 门控只允许**推迟**一个窗口，绝不能让音频变得不可达。判据要按"下一个已
+            # 执行窗口的左边界能否勾回上一次的右边界"来定，而不是按"跳过了多久"：决策
+            # 落在以首次决策为锚的 hop 网格上，满 hop 才轮到下一次，所以下一次执行必然
+            # 满足 end - last_executed >= window - hop，那时它的左边界 end - window 不晚
+            # 于 last_executed，两个窗口相接或重叠。
+            # 若要求攒满整个 window 才放行，每次执行都会在上一个窗口的右边界之后留下
+            # 最多 hop 秒的空隙（window % hop != 0 时每次都会留），那段音频永远落在所有
+            # 后续窗口的左边界之外——不可恢复。代价：持续静音时约每 window - hop 秒放行
+            # 一次推理，而不是一次都不跑。
+            if (
+                decision.end_sec - self._last_executed_end
+                <= self.config.window - self.config.hop
+            ):
                 # 整窗静音：跳过推理，但必须推进 last_run_sec，否则下次轮询会重算
                 # 同一个窗口，退化成忙等。
                 self._last_run_sec = decision.end_sec

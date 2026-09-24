@@ -83,9 +83,30 @@ class SessionStore:
         self._audio.write(arr)
 
     def append_committed(self, segments: Iterable[Any]) -> None:
-        with self.transcript_path.open("a", encoding="utf-8") as handle:
-            for item in segments:
-                handle.write(json.dumps(item.to_dict(), ensure_ascii=False) + "\n")
+        """整批追加已定稿段落；要么全写进去，要么一条都不留。
+
+        "一条都不留"是调用方的依赖：``RealtimeSession._commit`` 在定稿失败时会回滚水位线，
+        让下一个窗口重新定稿同一段内容。所以这里若留下半批，重来的那次就会把同一段文字
+        再写一遍（换上新 id 的重复行）——那不叫恢复，只是把丢失换成了重复。
+
+        做法：先在内存里把整批序列化好（后面某条坏了就一条都还没写），再一次写入；写入
+        本身抛异常时把文件截回追加前的长度。
+        """
+        payload = "".join(
+            json.dumps(item.to_dict(), ensure_ascii=False) + "\n" for item in segments
+        )
+        if not payload:
+            return
+        path = self.transcript_path
+        size_before = path.stat().st_size if path.exists() else 0
+        try:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(payload)
+        except Exception:
+            # 尽力截回追加前的长度。这里不吞异常：真正的失败原因要原样抛给调用方。
+            with path.open("r+b") as handle:
+                handle.truncate(size_before)
+            raise
 
     def write_provisional(self, segments: Iterable[Segment]) -> None:
         payload = [

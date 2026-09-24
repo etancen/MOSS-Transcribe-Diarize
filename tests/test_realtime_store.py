@@ -5,6 +5,7 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import soundfile as sf
@@ -114,6 +115,68 @@ class SessionStoreTest(unittest.TestCase):
         self.assertEqual([row["id"] for row in rows], ["seg-1", "seg-2"])
         self.assertEqual(rows[0]["speaker_name"], "张总")
         self.assertEqual(rows[1]["speaker"], "S02")
+
+    def test_a_failed_append_leaves_no_partial_batch(self):
+        # 序列化必须在写入之前整体完成：后面某条坏了，前面几条也不许落盘。否则调用方
+        # 回滚水位线之后重来的那次，会把同一段文字再写一遍（重复行）。
+        store = self._store()
+        store.append_committed([FakeCommitted("seg-1", 0.0, 1.0, "S01", "S01", "好", True)])
+        before = store.transcript_path.read_bytes()
+
+        class Unserializable(FakeCommitted):
+            def to_dict(self):
+                return {"id": self.id, "bad": object()}
+
+        with self.assertRaises(TypeError):
+            store.append_committed(
+                [
+                    FakeCommitted("seg-2", 1.0, 2.0, "S01", "S01", "第二条", True),
+                    Unserializable("seg-3", 2.0, 3.0, "S01", "S01", "第三条", True),
+                ]
+            )
+
+        self.assertEqual(store.transcript_path.read_bytes(), before)
+
+    def test_a_write_failure_is_truncated_back(self):
+        # 写入中途失败（磁盘满）会留下半截内容；截回追加前的长度，调用方的回滚才真的
+        # 等价于"这一批没发生过"。
+        store = self._store()
+        store.append_committed([FakeCommitted("seg-1", 0.0, 1.0, "S01", "S01", "好", True)])
+        before = store.transcript_path.read_bytes()
+
+        real_open = Path.open
+
+        class HalfWritingHandle:
+            """写下一半再抛异常，模拟写入中途失败。"""
+
+            def __init__(self, handle):
+                self._handle = handle
+
+            def write(self, text):
+                self._handle.write(text[: max(1, len(text) // 2)])
+                raise OSError("磁盘满了")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                self._handle.close()
+                return False
+
+            def __getattr__(self, name):
+                return getattr(self._handle, name)
+
+        def patched_open(path, *args, **kwargs):
+            handle = real_open(path, *args, **kwargs)
+            return HalfWritingHandle(handle) if path.name == "transcript.jsonl" else handle
+
+        with mock.patch.object(Path, "open", patched_open):
+            with self.assertRaises(OSError):
+                store.append_committed(
+                    [FakeCommitted("seg-2", 1.0, 2.0, "S01", "S01", "第二条", True)]
+                )
+
+        self.assertEqual(store.transcript_path.read_bytes(), before)
 
     def test_load_committed_skips_corrupt_lines(self):
         store = self._store()

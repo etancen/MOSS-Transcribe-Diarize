@@ -65,6 +65,23 @@ class FlakyEmbedder:
         return np.array([1.0, 0.0], dtype=np.float32)
 
 
+class SpanRecordingSession(RealtimeSession):
+    """记录每一次**真正执行**的推理窗口区间（被门控跳过的不算）。
+
+    窗口的起止是 ``run_pending`` 内部算出来的，事件里不带，所以"哪些音频被覆盖过"
+    只能从 ``_run_window`` 的入参观测。测试里覆盖这一个私有方法，是为了拿到真实发生过
+    的区间，而不是按公式重新推算一遍（那样会把待验证的公式写进断言里）。
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.spans: list[tuple[float, float]] = []
+
+    async def _run_window(self, start, end, audio):
+        self.spans.append((start, end))
+        return await super()._run_window(start, end, audio)
+
+
 def _config(**kwargs) -> RealtimeConfig:
     params = {
         "window": 20.0,
@@ -751,22 +768,70 @@ class SilenceGateTest(unittest.TestCase):
         self.assertEqual(status["gated_windows"], 1)
         self.assertAlmostEqual(status["gated_sec"], 10.0, places=2)
 
-    def test_gate_never_makes_audio_unreachable(self):
-        """持续静音时门控只能**推迟**推理，不能让音频永远落不到任何窗口里。
+    def _drive_gated(self, total_seconds: float, **kwargs) -> list[tuple[float, float]]:
+        """按 poll_interval 的节奏推流、每次推流后轮询，返回已执行的窗口区间。
 
-        缓冲会持续淘汰旧音频，而每个窗口最多往回覆盖 window 秒；若跳过之后不再兜底，
-        一个全程安静的会话会永远不再调用转写器——状态事件始终是 running，而语音（比如
-        每 15 秒半秒的"嗯"）已经滑出所有未来窗口的左边界，永久丢失。这里推 60 秒静音，
-        断言兜底在 total = 20 / 40 / 60 各放行了一次（每次窗口都是满的 20 秒）。
+        节奏必须与生产一致：决策点落在以首次决策为锚的 hop 网格上，而网格的位置取决于
+        推流节奏。按 5 秒一块推会让网格恰好落在 window 的整数倍上，把门控留下的空隙掩盖
+        掉——旧版本正是这样"通过"的。
         """
-        transcriber = ScriptedTranscriber(["[1][S01]a[2]"] * 20)
-        session = self._session(transcriber)
-
-        for _ in range(12):
-            session.push_audio(_silence(5.0))
+        config = _config(silence_gate=True, **kwargs)
+        session = SpanRecordingSession(
+            config,
+            transcriber=ScriptedTranscriber([]),
+            store=SessionStore(self.runs, "s1"),
+        )
+        pushed = 0.0
+        while pushed < total_seconds - 1e-9:
+            session.push_audio(_silence(config.poll_interval))
+            pushed += config.poll_interval
             self._run(session.run_pending())
+        return session.spans
 
-        self.assertEqual(transcriber.window_seconds, [20.0, 20.0, 20.0])
+    def _assert_no_unreachable_audio(self, spans: list[tuple[float, float]]) -> None:
+        """断言从 0 起、到最后一次执行窗口的末尾为止，没有一段音频落在所有窗口之外。
+
+        ``reached`` 从 0.0 起算，所以"首个窗口没有覆盖到会话开头"也算一个空隙；报告**全部**
+        空隙而不只报第一个，是为了让 `window % hop != 0` 那种"每次执行之后都留一个空隙"的
+        失败形态一次看清。
+
+        刻意**不**要求覆盖到最后一次执行之后的音频——那是设计内的待办：下一次调度最多再等
+        一个 hop，而它的左边界会被判据拉回到上一次的右边界之前。空隙才是不可恢复的那个，
+        因为后续窗口的左边界只会更晚，永远够不到它。
+        """
+        self.assertTrue(spans, "门控把每一次推理都跳过了")
+        holes: list[tuple[float, float]] = []
+        reached = 0.0
+        for start, end in spans:
+            if start > reached + 1e-9:
+                holes.append((round(reached, 3), round(start, 3)))
+            reached = max(reached, end)
+        self.assertEqual(holes, [], f"这些区间没有任何窗口覆盖: {holes}")
+        # 覆盖性是主断言，这条只防"门控退化成几乎不跑"。放在最后：否则它会先失败，把
+        # 真正想报的空隙盖住。
+        self.assertGreaterEqual(len(spans), 3, "门控把绝大部分推理都跳过了")
+
+    def test_gate_preserves_reachability_at_the_poll_cadence(self):
+        """持续静音时门控只能**推迟**推理，不能让音频变得不可达。
+
+        实测（0.5 秒一拍、window=20 / hop=5）：已执行窗口 [0,18]、[18,38]、[38,58]，
+        并集从 0 起连续。判据若退回 `end - last_executed < window`，同一节奏下实测得到
+        [3,23]、[23,43]——[0,3) 永远不会被任何窗口覆盖。
+        """
+        spans = self._drive_gated(60.0)
+
+        self._assert_no_unreachable_audio(spans)
+
+    def test_gate_preserves_reachability_when_hop_does_not_divide_the_window(self):
+        """window=20 / hop=7：window % hop != 0，空隙会出现在**每一次**执行之后。
+
+        实测（0.5 秒一拍）：已执行窗口 [0,15]、[9,29]、[23,43]、[37,57]，相邻两两相接或
+        重叠，并集从 0 起连续。退回 `< window` 的判据时实测得到 [2,22]、[23,43]，空隙
+        (22,23)。
+        """
+        spans = self._drive_gated(60.0, hop=7.0)
+
+        self._assert_no_unreachable_audio(spans)
 
 
 if __name__ == "__main__":
