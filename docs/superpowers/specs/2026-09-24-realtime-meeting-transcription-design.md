@@ -322,7 +322,7 @@ def create_realtime_app(*, config: RealtimeConfig, runner, embedder) -> FastAPI:
 | GET | `/api/runtime` | 后端信息、配置、声纹模型状态、vLLM 连通性 |
 | GET | `/api/sessions` | 历史会话列表 |
 | GET | `/api/sessions/{id}` | 单个会话详情（含定稿段和说话人表） |
-| GET | `/api/sessions/{id}/export?format=md\|srt\|json\|txt` | 导出，复用 `moss_transcribe_diarize/subtitle/export.py` |
+| GET | `/api/sessions/{id}/export?format=srt\|json\|ass\|md\|txt` | 导出。`srt`/`json`/`ass` 直接复用 `moss_transcribe_diarize/subtitle/export.py`；`md`/`txt` 在实时模块里各是一个小格式化函数（该包没有这两种） |
 | GET | `/api/sessions/{id}/audio` | 完整录音 |
 | POST | `/api/sessions/{id}/retranscribe` | 用落盘录音按文件模式重转一遍 |
 
@@ -360,7 +360,8 @@ JSON 事件（服务端 → 客户端）：
 {"type": "speaker", "speakers": [{"id": "S01", "name": "李工", "samples": 12}]}
 
 {"type": "status", "state": "running", "buffered_sec": 63.4, "rtf": 0.42,
- "last_window_ms": 2140, "lag_sec": 3.2, "degraded": false}
+ "last_window_ms": 2140, "lag_sec": 3.2, "degraded": false,
+ "gated_windows": 4, "gated_sec": 80.0}
 
 {"type": "error", "code": "transcribe_failed", "detail": "..."}
 ```
@@ -520,13 +521,17 @@ mtd-realtime = "moss_transcribe_diarize.app.realtime_cli:main"
 
 **阶段二：服务与协议**
 
-10. 抽出 `app/openai_audio_client.py`（上游改动，`VllmWindowTranscriber` 的前置）
-11. `VllmWindowTranscriber` + `OnnxCampplusEmbedder` + 模型下载与 SHA-256 校验
-12. `realtime_server` + WebSocket 协议
-13. `realtime_cli` + `pyproject.toml` 入口
-14. `scripts/realtime_client.py` 冒烟客户端
+10. ~~`OnnxCampplusEmbedder` + 模型下载与 SHA-256 校验~~ —— **已完成**（CAM++ ONNX，接上后两人会议的说话人标注从 2 段错变为 0 段错）
+11. 抽出 `app/openai_audio_client.py`（上游改动，是 `VllmWindowTranscriber` 的前置：现有的 `vllm_runner` 会 import torch，不能被实时路径复用）
+12. `VllmWindowTranscriber`；并把 token 预算改成**按实际窗口长度**推算（4.5 那两条接线要求，两个后端都要）
+13. `realtime/export.py`：`CommittedSegment` → `SubtitleSegment` 的桥接，加上 `md`/`txt` 两个格式化函数（`subtitle` 包里没有这两种）
+14. `realtime_server`：HTTP 路由 + WebSocket 端点 + 每会话的驱动任务
+15. `realtime_cli` + `pyproject.toml` 入口（含 `websockets` 依赖）
+16. `scripts/realtime_client.py` 冒烟客户端
 
 交付物：一个能跑起来的 `mtd-realtime`，可以用脚本推音频并收到事件。
+
+阶段一收尾时已顺带完成、不必再做：`SessionStore` 的 `session_id` 校验与路径穿越拒绝；`status` 事件的 `gated_windows` / `gated_sec` 可观测字段；静音门控的覆盖性保证与超预算窗口的记录。
 
 **阶段三：浏览器前端**
 
