@@ -26,6 +26,9 @@ class WindowPolicyTest(unittest.TestCase):
 
         decision = policy.decide(total_seconds=30.0, last_run_sec=None)
 
+        # 先钉住"这次运行真的发生了"：WindowDecision(False) 的 start_sec 默认就是 0.0，
+        # 一个"首次运行永不触发"的错误实现也能满足下面那条断言。
+        self.assertTrue(decision.should_run)
         self.assertEqual(decision.start_sec, 0.0)
 
     def test_later_runs_are_throttled_by_hop(self):

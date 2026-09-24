@@ -52,7 +52,14 @@ def segment_audio(
 
     刻意不从环形缓冲重新取——缓冲可能已经回绕并淘汰了这段音频，而窗口副本
     一定是完整的。
+
+    段落起点早于 ``window_start`` 时返回 ``None``：这段音频不在这份窗口副本里，按偏移
+    切只能拿到一段被左边界截断的音频，用它算出的声纹会把说话人认错，而且此后一直认错。
+    宁可交回 ``None``，让调用方走"未知说话人"路径。这条路径可达——``close()`` 的 flush
+    可能拿到**前一个窗口**留下的临时段，而收尾窗口的起点比它晚。
     """
+    if seg.start < window_start:
+        return None
     total = int(window_audio.size)
     start = int(round((seg.start - window_start) * sample_rate))
     end = int(round((seg.end - window_start) * sample_rate))
@@ -64,7 +71,16 @@ def segment_audio(
 
 
 class RealtimeSession:
-    """一个会话的全部状态与行为。不负责网络，只吐事件。"""
+    """一个会话的全部状态与行为。不负责网络，只吐事件。
+
+    **调用契约（并发）**：本类不是线程安全的。调用方必须先 ``await`` ``run_pending``
+    到完成，再调用 ``close()``——两者不得同时在飞。驱动的正常写法是每 ``poll_interval``
+    秒 ``await session.run_pending()`` 一次；若写成
+    ``asyncio.create_task(session.run_pending())`` 之后又 ``await session.close()``，
+    两个窗口就会跑在两个 executor 工作线程里，同时改 ``Stitcher`` 的水位线与临时快照、
+    ``SpeakerGallery`` 的条目、``_segment_counter`` 和 ``SessionStore``，后果是重复定稿
+    或错乱的临时区——而且不会抛任何异常。
+    """
 
     def __init__(
         self,
@@ -93,6 +109,12 @@ class RealtimeSession:
             sample_rate=config.sample_rate,
         )
         self._last_run_sec: float | None = None
+        # 上一次**真正跑过**的窗口的末尾（含失败的那次）。与 _last_run_sec 的区别：
+        # 后者是节流用的调度锚点，被静音门控跳过的窗口也会推进它；这个只在窗口真的
+        # 跑过时推进，静音门控靠它兜住"音频不能被跳过到不可达"的下限。
+        self._last_executed_end = 0.0
+        self._gated_windows = 0
+        self._gated_sec = 0.0
         self._window_running = False
         self._failures = 0
         self._window_id = 0
@@ -136,10 +158,18 @@ class RealtimeSession:
             self.config.silence_rms_db,
             self.config.silence_frame_ratio,
         ):
-            # 整窗静音：跳过推理，但必须推进 last_run_sec，否则下次轮询会重算
-            # 同一个窗口，退化成忙等。
-            self._last_run_sec = decision.end_sec
-            return [self._status_event()]
+            # 门控只允许**推迟**一个窗口，绝不能让音频变得不可达。环形缓冲持续淘汰旧
+            # 音频，而每个窗口最多往回覆盖 window 秒：距上次真正跑过的窗口已满 window 秒
+            # 时，再跳过就会有音频永远落在任何后续窗口的左边界之外——那个位置不会再有
+            # 窗口覆盖它，丢失不可恢复。所以这里兜一道底：持续静音时约每 window 秒放行
+            # 一次（代价是几次推理），而不是一次都不跑。
+            if decision.end_sec - self._last_executed_end < self.config.window:
+                # 整窗静音：跳过推理，但必须推进 last_run_sec，否则下次轮询会重算
+                # 同一个窗口，退化成忙等。
+                self._last_run_sec = decision.end_sec
+                self._gated_windows += 1
+                self._gated_sec += decision.end_sec - decision.start_sec
+                return [self._status_event()]
         return await self._run_window(decision.start_sec, decision.end_sec, audio)
 
     async def close(self) -> list[dict]:
@@ -181,8 +211,11 @@ class RealtimeSession:
 
         与 ``_process_window`` 一样整个在工作线程里跑。返回的两个值正是事件构造需要
         的：本次 flush 是否有内容（决定要不要补一个"临时区已清空"事件），以及新定稿
-        的段落。在工作线程里改 stitcher / gallery / store / 段落计数器是安全的，理由
-        与 ``_process_window`` 相同——一次会话里这些状态只被串行触碰。
+        的段落。
+
+        `stitcher` / `gallery` / `store` / 段落计数器都**不是**线程安全的；写它们之所以
+        安全，靠的是 ``RealtimeSession`` 文档里的调用契约——调用方先 await ``run_pending``
+        到完成再调用 ``close()``，两者不并发。这条契约由调用方保证，代码本身不强制它。
         """
         before_until = self._stitcher.committed_until
         before_provisional = self._stitcher.provisional
@@ -224,6 +257,9 @@ class RealtimeSession:
         finally:
             self._window_running = False
             self._last_run_sec = end
+            # 无论成败都推进：失败的那一窗同样需要窗口重新覆盖它，静音门控的下限对
+            # 它同样适用（见 run_pending 里的说明）。
+            self._last_executed_end = end
         self._failures = 0
         self._last_window_sec = time.perf_counter() - started
 
@@ -329,4 +365,8 @@ class RealtimeSession:
             "last_window_ms": int(round(self._last_window_sec * 1000)),
             "lag_sec": round(lag, 2),
             "degraded": degraded,
+            # 静音门控跳过过多少：这是"被跳过"唯一的对外可见之处（状态仍是 running），
+            # 否则一个持续把语音误判成静音的会话与健康会话在事件上完全一样。
+            "gated_windows": self._gated_windows,
+            "gated_sec": round(self._gated_sec, 2),
         }

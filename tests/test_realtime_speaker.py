@@ -161,6 +161,8 @@ class SpeakerGalleryTest(unittest.TestCase):
         assignments = gallery.assign([_seg(0.0, 0.2, "S01", 0)], lambda seg: voice)
 
         self.assertFalse(assignments[0].confident)
+        # 只断言 confident 不够：过短分支若错成"返回局部标签"，confident 仍是 False。
+        self.assertEqual(assignments[0].speaker_id, UNKNOWN_SPEAKER_ID)
 
     def test_unknown_speaker_appears_in_the_roster(self):
         gallery = SpeakerGallery(FakeEmbedder({}), min_segment_sec=0.1)

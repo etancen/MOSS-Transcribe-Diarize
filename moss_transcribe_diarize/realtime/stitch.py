@@ -143,7 +143,12 @@ class Stitcher:
         committed = [seg for seg in candidates if seg.end <= cutoff]
         self._provisional = [seg for seg in candidates if seg.end > cutoff]
         if committed:
-            self._committed_until = max(self._committed_until, committed[-1].end)
+            # 取 max 而不是 committed[-1].end：候选按 (start, end) 排序，重叠段的最后一个
+            # 未必是 end 最大的那个。少推进会让下一个窗口重复定稿已定稿的内容（用户可见
+            # 的重复字幕行）。
+            self._committed_until = max(
+                self._committed_until, max(seg.end for seg in committed)
+            )
         return StitchResult(committed=committed, provisional=list(self._provisional))
 
     def flush(self) -> list[Segment]:
@@ -151,7 +156,7 @@ class Stitcher:
         remaining = self._provisional
         self._provisional = []
         if remaining:
-            self._committed_until = max(self._committed_until, remaining[-1].end)
+            self._committed_until = max(self._committed_until, max(seg.end for seg in remaining))
         return remaining
 
     def restore_after_failed_commit(self, committed_until: float, provisional: list[Segment]) -> None:

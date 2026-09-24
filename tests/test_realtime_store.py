@@ -190,6 +190,30 @@ class SessionStoreTest(unittest.TestCase):
 
         self.assertNotEqual(first.session_id, second.session_id)
 
+    def test_session_dir_rejects_a_traversing_id(self):
+        # 阶段二的 GET /api/sessions/{id} 会把 URL 段原样传进来，这里不拦住就是路径穿越。
+        for bad in ("../evil", "..", ".", "a/b", "a\\b", ""):
+            with self.subTest(session_id=bad):
+                with self.assertRaises(ValueError):
+                    SessionStore.session_dir(self.runs, bad)
+
+    def test_constructing_a_store_with_a_traversing_id_is_rejected(self):
+        with self.assertRaises(ValueError):
+            SessionStore(self.runs, "../../evil")
+        self.assertFalse((self.runs.parent.parent / "evil").exists())
+
+    def test_load_committed_rejects_a_traversing_id(self):
+        with self.assertRaises(ValueError):
+            SessionStore.load_committed(self.runs, "../sess-1")
+
+    def test_ordinary_ids_are_still_accepted(self):
+        store = SessionStore(self.runs, "20260924-101112-a1b2c3")
+
+        self.assertEqual(store.dir, self.runs / "20260924-101112-a1b2c3")
+        self.assertEqual(
+            SessionStore.session_dir(self.runs, "a.b_c-1"), self.runs / "a.b_c-1"
+        )
+
     def test_list_sessions_returns_newest_first(self):
         SessionStore(self.runs, "a").write_meta(started_at=1.0)
         SessionStore(self.runs, "b").write_meta(started_at=2.0)

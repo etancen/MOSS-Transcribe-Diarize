@@ -10,7 +10,8 @@ from pathlib import Path
 import numpy as np
 
 from moss_transcribe_diarize.realtime.config import RealtimeConfig
-from moss_transcribe_diarize.realtime.session import RealtimeSession
+from moss_transcribe_diarize.realtime.session import RealtimeSession, segment_audio
+from moss_transcribe_diarize.realtime.stitch import Segment
 from moss_transcribe_diarize.realtime.store import SessionStore
 
 SILENCE = np.zeros(0, dtype=np.float32)  # 占位，实际音频由 _speech/_silence 生成
@@ -589,6 +590,68 @@ class FailedCommitTest(unittest.TestCase):
         )
 
 
+class CommittedSegmentContractTest(unittest.TestCase):
+    """``transcript.jsonl`` 的字段形状是跨阶段契约：阶段二的 HTTP API、导出桥和前端
+    都直接读它，而字段名本身并不说明 ``speaker`` 存的是 id、``speaker_name`` 才是显示名。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.runs = Path(self._tmp.name) / "runs"
+
+    def test_to_dict_emits_the_seven_keys_and_speaker_holds_the_id(self):
+        class Unembeddable:
+            """声纹嵌入返回 None，于是段落落到 U00/未知 这条路径上——id 与显示名不同，
+            互换两个键名或改掉任一个都会打挂下面的断言。"""
+
+            embedding_dim = 2
+
+            def embed(self, audio, sample_rate):
+                return None
+
+        transcriber = ScriptedTranscriber(["[1][S01]你好[2]"])
+        session = RealtimeSession(
+            _config(),
+            transcriber=transcriber,
+            store=SessionStore(self.runs, "s1"),
+            embedder=Unembeddable(),
+        )
+        session.push_audio(_speech(8.0))
+
+        events = asyncio.run(session.run_pending())
+
+        committed = next(event for event in events if event["type"] == "committed")
+        row = committed["segments"][0]
+        self.assertEqual(
+            set(row),
+            {"id", "start", "end", "speaker", "speaker_name", "text", "speaker_confident"},
+        )
+        self.assertEqual(row["speaker"], "U00")
+        self.assertEqual(row["speaker_name"], "未知")
+        self.assertIs(row["speaker_confident"], False)
+        self.assertEqual(row["id"], "seg-1")
+
+        # 真正被写进 transcript.jsonl 的那一行与事件里的字典是同一份契约。
+        self.assertEqual(SessionStore.load_committed(self.runs, "s1"), [row])
+
+
+class SegmentAudioTest(unittest.TestCase):
+    def test_segment_starting_before_the_window_returns_none(self):
+        audio = np.zeros(16000, dtype=np.float32)
+        seg = Segment(start=18.0, end=30.0, speaker="S01", text="跨窗", window_id=1)
+
+        self.assertIsNone(segment_audio(audio, 20.0, seg, 16000))
+
+    def test_segment_inside_the_window_is_sliced_by_offset(self):
+        audio = np.arange(32000, dtype=np.float32)
+        seg = Segment(start=1.0, end=2.0, speaker="S01", text="x", window_id=0)
+
+        sliced = segment_audio(audio, 0.0, seg, 16000)
+
+        self.assertEqual(sliced.size, 16000)
+        self.assertEqual(sliced[0], 16000.0)
+
+
 class SilenceGateTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -670,6 +733,40 @@ class SilenceGateTest(unittest.TestCase):
         self._run(session.run_pending())
 
         self.assertEqual(len(transcriber.window_seconds), 1)
+
+    def test_status_event_reports_gated_windows(self):
+        """跳过必须可观测：状态事件在门控下始终报 running，与健康会话无从区分。
+
+        没有这两个字段，"整场会议被误判成静音、一次推理都没跑"和正常会话发出的事件
+        完全一样。
+        """
+        transcriber = ScriptedTranscriber(["[1][S01]a[2]"] * 3)
+        session = self._session(transcriber)
+        session.push_audio(_silence(10.0))
+
+        events = self._run(session.run_pending())
+
+        self.assertEqual(transcriber.window_seconds, [])
+        status = next(event for event in events if event["type"] == "status")
+        self.assertEqual(status["gated_windows"], 1)
+        self.assertAlmostEqual(status["gated_sec"], 10.0, places=2)
+
+    def test_gate_never_makes_audio_unreachable(self):
+        """持续静音时门控只能**推迟**推理，不能让音频永远落不到任何窗口里。
+
+        缓冲会持续淘汰旧音频，而每个窗口最多往回覆盖 window 秒；若跳过之后不再兜底，
+        一个全程安静的会话会永远不再调用转写器——状态事件始终是 running，而语音（比如
+        每 15 秒半秒的"嗯"）已经滑出所有未来窗口的左边界，永久丢失。这里推 60 秒静音，
+        断言兜底在 total = 20 / 40 / 60 各放行了一次（每次窗口都是满的 20 秒）。
+        """
+        transcriber = ScriptedTranscriber(["[1][S01]a[2]"] * 20)
+        session = self._session(transcriber)
+
+        for _ in range(12):
+            session.push_audio(_silence(5.0))
+            self._run(session.run_pending())
+
+        self.assertEqual(transcriber.window_seconds, [20.0, 20.0, 20.0])
 
 
 if __name__ == "__main__":

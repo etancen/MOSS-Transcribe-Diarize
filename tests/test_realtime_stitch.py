@@ -228,6 +228,30 @@ class StitcherTest(unittest.TestCase):
         self.assertEqual([s.text for s in second.committed], ["嗯"])
         self.assertEqual(stitcher.committed_until, 13.0)
 
+    def test_watermark_advances_past_overlapping_segments(self):
+        # 候选按 (start, end) 排序，所以最后一个不一定是 end 最大的那个：这里
+        # (1, 10) 排在 (2, 3) 前面。若水位线取 committed[-1].end，它只推到 3.0，
+        # 3-10 这段已定稿内容会被下一个窗口再定稿一次——用户可见的重复字幕行。
+        stitcher = Stitcher(window=20.0, tail=0.0)
+        first = stitcher.ingest(
+            window_start=0.0,
+            window_end=20.0,
+            raw_text=_rawl((1.0, 10.0, "S01", "长"), (2.0, 3.0, "S02", "短")),
+            window_id=0,
+        )
+        self.assertEqual([s.text for s in first.committed], ["长", "短"])
+        self.assertEqual(stitcher.committed_until, 10.0)
+
+        second = stitcher.ingest(
+            window_start=0.0,
+            window_end=20.0,
+            raw_text=_rawl((5.0, 7.0, "S01", "重叠区")),
+            window_id=1,
+        )
+
+        self.assertEqual(second.committed, [])
+        self.assertEqual(stitcher.committed_until, 10.0)
+
     def test_segment_straddling_the_watermark_is_dropped(self):
         stitcher = Stitcher(window=20.0, tail=6.0)
         stitcher.ingest(

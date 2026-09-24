@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from pathlib import Path
@@ -12,6 +13,22 @@ import numpy as np
 import soundfile as sf
 
 from .stitch import Segment
+
+# 会话 id 会被直接拼进路径，所以只允许单层、无路径分隔符的字符集合。`.`/`..` 虽
+# 匹配字符集却仍能跳出 runs_dir，单独拒掉。
+_SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def _validate_session_id(session_id: str) -> str:
+    """校验会话 id 可以安全地作为一个目录名使用。
+
+    这是唯一的两处拼接（``__init__`` 与 ``session_dir``）共用的守卫。阶段二的
+    ``GET /api/sessions/{id}`` 会把 URL 段原样传进来，不在这里拦住就是路径穿越。
+    """
+    text = str(session_id)
+    if not _SESSION_ID_PATTERN.fullmatch(text) or text in (".", ".."):
+        raise ValueError(f"invalid session id: {session_id!r}")
+    return text
 
 
 class SessionStore:
@@ -32,7 +49,9 @@ class SessionStore:
         name: str = "",
     ):
         self.runs_dir = Path(runs_dir).expanduser()
-        self.session_id = session_id or f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        self.session_id = _validate_session_id(
+            session_id or f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        )
         self.dir = self.runs_dir / self.session_id
         self.dir.mkdir(parents=True, exist_ok=True)
         self.sample_rate = int(sample_rate)
@@ -109,7 +128,7 @@ class SessionStore:
 
     @staticmethod
     def session_dir(runs_dir: str | Path, session_id: str) -> Path:
-        return Path(runs_dir).expanduser() / session_id
+        return Path(runs_dir).expanduser() / _validate_session_id(session_id)
 
     @staticmethod
     def load_committed(runs_dir: str | Path, session_id: str) -> list[dict]:
