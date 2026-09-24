@@ -156,6 +156,15 @@ class SessionStore:
         return Path(runs_dir).expanduser() / _validate_session_id(session_id)
 
     @staticmethod
+    def load_meta(runs_dir: str | Path, session_id: str) -> dict:
+        """读取任意已有会话的 session.json；不存在或损坏时返回空 dict。
+
+        会先校验 session_id：这层的调用方是 HTTP 路由，URL 段直接传进来。
+        """
+        path = SessionStore.session_dir(runs_dir, session_id) / "session.json"
+        return _read_json_object(path)
+
+    @staticmethod
     def load_committed(runs_dir: str | Path, session_id: str) -> list[dict]:
         path = SessionStore.session_dir(runs_dir, session_id) / "transcript.jsonl"
         if not path.exists():
