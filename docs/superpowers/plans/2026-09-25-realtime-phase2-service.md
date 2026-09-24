@@ -46,6 +46,8 @@
 **Files:**
 - Create: `moss_transcribe_diarize/app/openai_audio_client.py`
 - Modify: `moss_transcribe_diarize/app/vllm_runner.py`（改为调用新模块）
+- Modify: `moss_transcribe_diarize/app/__init__.py`（改成惰性导入——见 Step 0）
+- Modify: `tests/test_vllm_runner.py`（打桩点从 `_post_multipart` 换成新模块的请求函数——见 Step 6）
 - Test: `tests/test_openai_audio_client.py`
 
 **Interfaces:**
@@ -57,6 +59,56 @@
   - `extract_transcription_text(response: dict) -> str`
   - `consume_sse_transcription(response, *, on_progress=None) -> dict`
   - `transcribe_bytes(*, base_url, model, prompt, file_bytes, filename="audio.wav", content_type="audio/wav", api_key="EMPTY", timeout=600.0, max_new_tokens=1024, decoding="greedy", temperature=None, on_progress=None) -> dict`，返回 `{"text": str, "usage": {"prompt_tokens": int, "completion_tokens": int}}`
+
+- [ ] **Step 0: 先让 `app/__init__.py` 惰性化**
+
+**这一步不做，本任务的核心主张就是假的。** `moss_transcribe_diarize/app/__init__.py` 现在只有一行 `from .server import create_app`，而 `server.py` → `jobs.py` → `model_runner.py` 在顶层 `import torch`。所以 `import moss_transcribe_diarize.app.openai_audio_client` 会**先执行父包的 `__init__.py`**，照样把 torch 拖进来——新模块自己写得多干净都白费。
+
+这与阶段一 Task 1 在包根上做的是同一件事（那里改的是 `moss_transcribe_diarize/__init__.py`），技术也相同：PEP 562 的模块级 `__getattr__`。
+
+把 `moss_transcribe_diarize/app/__init__.py` 整体改成：
+
+```python
+"""Subtitle and realtime applications.
+
+``create_app`` is resolved lazily (PEP 562) so that importing a lightweight
+submodule does not drag in ``server`` and, through it, torch.
+``app.openai_audio_client`` in particular has to stay importable in a process
+that has never loaded torch — that is the whole point of the realtime service's
+slim deployment.
+"""
+
+from __future__ import annotations
+
+import importlib
+from typing import Any
+
+_LAZY_ATTRIBUTES = {"create_app": "server"}
+
+__all__ = sorted(_LAZY_ATTRIBUTES)
+
+
+def __getattr__(name: str) -> Any:
+    module_name = _LAZY_ATTRIBUTES.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(importlib.import_module(f".{module_name}", __name__), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
+```
+
+先确认没有东西依赖它是急切的：
+
+Run: `grep -rn "from moss_transcribe_diarize.app import\|from .app import\|from ..app import" moss_transcribe_diarize tests`
+
+期望：要么没有命中，要么命中的是 `create_app` 这种仍然能解析的名字。**若有任何地方 `from moss_transcribe_diarize.app import *`，停下来报告**——那是惰性导入唯一会破的用法。
+
+Run: `.venv/Scripts/python.exe -m pytest tests/ -q`
+Expected: 全绿（本步只换解析时机，不该改变任何行为）
 
 - [ ] **Step 1: 读现有的 vllm_runner.py，把要搬的三段抄出来**
 
@@ -429,13 +481,15 @@ Expected: 全部 PASS
 
 - [ ] **Step 6: 让 `vllm_runner.py` 改用新模块**
 
-打开 `moss_transcribe_diarize/app/vllm_runner.py`，做这些替换（**只做这些**，别顺手改别的）：
+**先注意**：`tests/test_vllm_runner.py` 现在**直接依赖**几处私有接口——它打桩 `runner._post_multipart`（:26），并直接调 `runner._transcriptions_url()`（:58、:62）。所以这一步不只是改实现，**还要改那个测试的打桩点**，否则"回归保障"会变成"被打挂的东西"（Step 8 的验收会失败）。这是本任务必须一起做的一步，不是可选清理。
 
-1. 删掉模块级的 `_transcriptions_url`、`_multipart_body`、`_extract_transcription_text`、`_consume_sse_transcription`，以及它们现在只被这里用到的 `import io`、`import urllib.*`、`import uuid`（`io` 还要留着给 `_media_to_wav_bytes` 用，看 Step 7）。
+打开 `moss_transcribe_diarize/app/vllm_runner.py`，做这些替换（**只做这些**）：
+
+1. 删掉模块级的 `_transcriptions_url`、`_multipart_body`、`_extract_transcription_text`、`_consume_sse_transcription` 四个自由函数，以及 `VllmRunner` 上的 `_build_fields`、`_transcriptions_url`、`_post_multipart` 三个方法（它们的内容现在住在 `transcribe_bytes` 里）。
 2. 加 import：
 
 ```python
-from .openai_audio_client import extract_transcription_text, transcribe_bytes
+from .openai_audio_client import encode_wav_bytes, extract_transcription_text, transcribe_bytes
 ```
 
 3. `transcribe()` 里把 `self._post_multipart(...)` 那一段换成：
@@ -464,7 +518,36 @@ from .openai_audio_client import extract_transcription_text, transcribe_bytes
         usage = response.get("usage") or {}
 ```
 
-4. 删掉 `_build_fields` 与 `_transcriptions_url` 这两个方法（它们的内容现在住在 `transcribe_bytes` 里）。
+4. 清掉因此变成死引用的 import（`io`、`urllib.*`、`uuid`、`soundfile`——`io`/`soundfile` 若 `_media_to_wav_bytes` 还用得到就留着，见 Step 7）。
+
+5. **改 `tests/test_vllm_runner.py` 的两处**：
+
+   - 把打桩从 `runner._post_multipart = fake_post_multipart` 换成**打桩新模块的请求函数**。最省事的形式是在 `vllm_runner` 的命名空间里替换掉它引用的那个名字：
+
+```python
+            import moss_transcribe_diarize.app.vllm_runner as vllm_runner_module
+
+            def fake_transcribe_bytes(**kwargs):
+                sent.append(kwargs)
+                return {"text": "[0.5][S01]你好[1.5]", "usage": {"completion_tokens": 9}}
+
+            vllm_runner_module.transcribe_bytes = fake_transcribe_bytes
+            self.addCleanup(setattr, vllm_runner_module, "transcribe_bytes", original)
+```
+
+   （`original` 在替换前先存下来。用 `addCleanup` 还原，别靠测试自己收尾。）
+
+   - 把 `runner._transcriptions_url()` 的断言改成对新模块自由函数的断言：
+
+```python
+        from moss_transcribe_diarize.app.openai_audio_client import transcriptions_url
+
+        self.assertEqual(
+            transcriptions_url("http://host:8000/v1"), "http://host:8000/v1/audio/transcriptions"
+        )
+```
+
+   **别把这两条断言删掉**——它们钉的是 URL 归一，那正是被搬走的逻辑；搬到新模块上继续钉，才算回归保障。
 
 - [ ] **Step 7: 收敛 `_media_to_wav_bytes`**
 
