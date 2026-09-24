@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,7 +11,9 @@ import soundfile as sf
 
 from moss_transcribe_diarize.realtime.transcriber import (
     HfWindowTranscriber,
+    VllmWindowTranscriber,
     WindowTranscriber,
+    token_budget,
 )
 
 
@@ -100,6 +104,90 @@ class HfWindowTranscriberTest(unittest.TestCase):
         self.assertEqual(
             transcriber.transcribe_window(np.zeros(0, dtype=np.float32), prompt="p"), ""
         )
+
+
+class TokenBudgetTest(unittest.TestCase):
+    def test_scales_with_the_actual_audio(self):
+        # 20 秒 -> 20*51 = 1020
+        self.assertEqual(token_budget(np.zeros(20 * 16000, dtype=np.float32), 16000), 1020)
+
+    def test_a_long_forced_window_gets_a_bigger_budget(self):
+        # 覆盖性保证会让被迫放行的窗口长于 config.window（实测到过 100 秒），
+        # 按 window 定死的预算会把它们的尾部截掉。
+        self.assertEqual(token_budget(np.zeros(60 * 16000, dtype=np.float32), 16000), 3060)
+
+    def test_floor_applies_to_short_windows(self):
+        self.assertEqual(token_budget(np.zeros(16000, dtype=np.float32), 16000, floor=1024), 1024)
+
+    def test_cap_wins_when_given(self):
+        self.assertEqual(
+            token_budget(np.zeros(60 * 16000, dtype=np.float32), 16000, cap=999), 999
+        )
+
+    def test_never_returns_less_than_the_minimum(self):
+        self.assertEqual(token_budget(np.zeros(16, dtype=np.float32), 16000), 256)
+
+
+class HfWindowTranscriberBudgetTest(unittest.TestCase):
+    """沿用本文件已有的 FakeRunner。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.scratch = Path(self._tmp.name) / "scratch"
+
+    def test_budget_follows_the_window_it_is_given(self):
+        runner = FakeRunner()
+        transcriber = HfWindowTranscriber(runner, self.scratch, token_budget_floor=256)
+
+        transcriber.transcribe_window(np.zeros(20 * 16000, dtype=np.float32), prompt="p")
+
+        self.assertEqual(runner.calls[-1]["max_new_tokens"], 1020)
+
+    def test_explicit_max_new_tokens_still_caps(self):
+        runner = FakeRunner()
+        transcriber = HfWindowTranscriber(runner, self.scratch, max_new_tokens=777)
+
+        transcriber.transcribe_window(np.zeros(60 * 16000, dtype=np.float32), prompt="p")
+
+        self.assertEqual(runner.calls[-1]["max_new_tokens"], 777)
+
+
+class VllmWindowTranscriberTest(unittest.TestCase):
+    def test_is_a_window_transcriber(self):
+        transcriber = VllmWindowTranscriber(base_url="http://x", model="m")
+        self.assertIsInstance(transcriber, WindowTranscriber)
+
+    def test_window_is_encoded_and_posted_without_touching_torch(self):
+        sent: list[dict] = []
+
+        def fake_post(**kwargs):
+            sent.append(kwargs)
+            return {"text": "[0.5][S01]你好[1.5]", "usage": {"completion_tokens": 9}}
+
+        transcriber = VllmWindowTranscriber(
+            base_url="http://x", model="m", token_budget_floor=256, post=fake_post
+        )
+
+        text = transcriber.transcribe_window(np.zeros(20 * 16000, dtype=np.float32), prompt="p")
+
+        self.assertEqual(text, "[0.5][S01]你好[1.5]")
+        self.assertEqual(sent[0]["model"], "m")
+        self.assertEqual(sent[0]["prompt"], "p")
+        self.assertEqual(sent[0]["max_new_tokens"], 1020)
+        self.assertTrue(sent[0]["file_bytes"].startswith(b"RIFF"))
+
+    def test_module_imports_without_torch(self):
+        code = (
+            "import sys\n"
+            "for name in ('torch', 'transformers', 'moss_transcribe_diarize.app.model_runner'):\n"
+            "    sys.modules[name] = None\n"
+            "import moss_transcribe_diarize.realtime.transcriber as t\n"
+            "assert hasattr(t, 'VllmWindowTranscriber')\n"
+            "print('IMPORT_OK')\n"
+        )
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        self.assertIn("IMPORT_OK", result.stdout, result.stderr)
 
 
 if __name__ == "__main__":

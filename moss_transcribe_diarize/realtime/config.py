@@ -4,10 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# 输出 token 速率估算：默认 prompt 下约每音频秒 51 个 token。
-# 这是给 max_new_tokens 定默认值的起点，真机实测后应据实调整。
-TOKENS_PER_AUDIO_SECOND = 51
-MIN_MAX_NEW_TOKENS = 256
+from .transcriber import MIN_NEW_TOKENS, TOKENS_PER_AUDIO_SECOND
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,7 +78,13 @@ class RealtimeConfig:
             raise ValueError("max_consecutive_failures must be positive")
 
     def effective_max_new_tokens(self) -> int:
-        """窗口越长需要的输出 token 越多；未显式设置时按窗口秒数推算。"""
+        """按 ``window`` 推算的预算——**只用作下限**。
+
+        真正的预算是按每次拿到的音频长度算的（见 ``transcriber.token_budget``）：
+        4.7 的覆盖性保证会让被迫放行的窗口长于 ``window``，按 ``window`` 定死的预算
+        会把它们的尾部截掉。这里保留这个方法，是给调用方一个"一个 window 长的窗口
+        至少需要多少 token"的下限。
+        """
         if self.max_new_tokens is not None:
             return self.max_new_tokens
-        return max(MIN_MAX_NEW_TOKENS, int(round(self.window * TOKENS_PER_AUDIO_SECOND)))
+        return max(MIN_NEW_TOKENS, int(round(self.window * TOKENS_PER_AUDIO_SECOND)))
