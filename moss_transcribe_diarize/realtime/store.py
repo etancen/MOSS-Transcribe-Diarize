@@ -112,6 +112,18 @@ class SessionStore:
                 handle.truncate(size_before)
             raise
 
+    def rewrite_committed(self, segments: Iterable[Any]) -> None:
+        """整体重写 ``transcript.jsonl``。
+
+        段落被改动过（例如改了说话人）时用这个，而不是再 append 一遍——append 会留下
+        同 id 的第二行，``load_committed`` 读出来就是重复。
+
+        与 ``append_committed`` 同样的纪律：先把整批序列化好，再写一次，所以中途失败不会
+        留下半截文件。
+        """
+        lines = [json.dumps(item.to_dict(), ensure_ascii=False) for item in segments]
+        self.transcript_path.write_text("".join(line + "\n" for line in lines), encoding="utf-8")
+
     def write_provisional(self, segments: Iterable[Segment]) -> None:
         payload = [
             {

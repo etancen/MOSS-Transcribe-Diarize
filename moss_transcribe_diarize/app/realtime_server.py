@@ -7,14 +7,37 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+import time
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
+
+try:  # pragma: no cover - 只是为了给路由的形参注解一个可解析的名字
+    # FastAPI 用 ``get_type_hints`` 解析处理函数的注解，而它只看**模块全局**——所以
+    # ``websocket: WebSocket`` 这个注解必须在这里绑定，写进 ``create_realtime_app``
+    # 的函数体里是不够的（那样 FastAPI 会把 ``websocket`` 当成查询参数，连接直接被
+    # 1008 拒掉）。其余 fastapi 名字仍然在函数里惰性导入。
+    from fastapi import WebSocket
+except ImportError:                                   # 轻量部署没装 fastapi
+    WebSocket = None  # type: ignore[assignment]
+
 from moss_transcribe_diarize.realtime.config import RealtimeConfig
 from moss_transcribe_diarize.realtime.export import EXPORT_FORMATS, export_session
+from moss_transcribe_diarize.realtime.session import RealtimeSession
 from moss_transcribe_diarize.realtime.store import SessionStore
 
 STATIC_DIR = Path(__file__).with_name("static")
+
+MAX_PENDING_SECONDS = 60.0
+"""``start`` 之前最多代管多少秒音频。
+
+浏览器开麦往往早于它发 ``start``，那些音频不能丢；但一个从不发 ``start`` 的客户端
+（或一个坏掉的前端）不该能把服务端的内存堆满，所以超出上限就丢最旧的——与环形
+缓冲同一套语义：保新不保旧。
+"""
 
 
 def _speaker_names(meta: dict[str, Any]) -> dict[str, str]:
@@ -23,6 +46,18 @@ def _speaker_names(meta: dict[str, Any]) -> dict[str, str]:
         for item in meta.get("speakers") or []
         if isinstance(item, dict) and item.get("id")
     }
+
+
+def _trim_pending(pending: list[np.ndarray], limit_samples: int) -> int:
+    """把 ``start`` 之前攒下的帧裁到 ``limit_samples`` 个样本，丢弃最旧的。
+
+    返回裁剪后剩下的样本数。只保留最后一帧是**有意**的兜底：单帧就超上限时也要让
+    会话收到东西，而不是把整个待处理列表清空。
+    """
+    total = sum(int(frame.size) for frame in pending)
+    while total > limit_samples and len(pending) > 1:
+        total -= int(pending.pop(0).size)
+    return total
 
 
 def _with_hotwords(prompt: str, hotwords: Any) -> str:
@@ -62,6 +97,7 @@ def create_realtime_app(
     embedder: Any = None,
     runs_dir: str | Path = "runs/realtime",
     static_dir: str | Path | None = None,
+    probe: Callable[[], dict[str, Any]] | None = None,
 ):
     try:
         from fastapi import FastAPI, HTTPException, Query
@@ -111,7 +147,7 @@ def create_realtime_app(
                 "speaker_threshold": config.speaker_threshold,
                 "poll_interval": config.poll_interval,
             },
-            "backend": _transcriber_info(transcriber_factory),
+            "backend": _transcriber_info(transcriber_factory, probe),
             "speaker": {
                 "enabled": embedder is not None,
                 "provider": type(embedder).__name__ if embedder is not None else None,
@@ -150,9 +186,191 @@ def create_realtime_app(
             return error("invalid_format", str(exc), 400)
         return JSONResponse({"format": format, "text": text})
 
+    @app.websocket("/ws/realtime")
+    async def realtime_socket(websocket: WebSocket):
+        from fastapi import WebSocketDisconnect
+
+        await websocket.accept()
+        session: RealtimeSession | None = None
+        session_id: str | None = None
+        pump: asyncio.Task | None = None
+        pending: list[np.ndarray] = []
+        stopping = asyncio.Event()
+        pending_limit = int(MAX_PENDING_SECONDS * config.sample_rate)
+
+        async def _send(payload: dict) -> None:
+            try:
+                await websocket.send_json(payload)
+            except Exception:                                   # 客户端已断开
+                pass
+
+        async def pump_windows() -> None:
+            while True:
+                try:
+                    events = await session.run_pending()
+                except Exception as exc:                        # 兜底：绝不让驱动任务静默死掉
+                    await _send({"type": "error", "code": "driver_failed", "detail": str(exc)})
+                    return
+                for event in events:
+                    await _send(event)
+                if stopping.is_set():
+                    return
+                try:
+                    await asyncio.wait_for(stopping.wait(), timeout=config.poll_interval)
+                except asyncio.TimeoutError:
+                    continue
+
+        async def _start(source: dict) -> None:
+            nonlocal session, session_id, pump
+            if session is not None:
+                return                                          # 重复的 start：忽略，不另开会话
+            prompt = _with_hotwords(str(source.get("prompt") or ""), source.get("hotwords")) or None
+            store = SessionStore(runs, name=str(source.get("session_name") or ""))
+            session = RealtimeSession(
+                config,
+                transcriber=transcriber_factory(),
+                store=store,
+                embedder=embedder,
+                **({"prompt": prompt} if prompt else {}),
+            )
+            session_id = store.session_id
+            registry.add(session_id, session)
+            for frame in pending:
+                session.push_audio(frame)
+            pending.clear()
+            # 先把这个事件发出去再起驱动任务：客户端要保证它收到的第一条就是
+            # session 描述符（里面有 session_id），否则它无从知道自己在跟谁说话。
+            await _send({
+                "type": "session",
+                "session_id": session_id,
+                "started_at": time.time(),
+                "config": {
+                    "window": config.window, "hop": config.hop, "tail": config.tail,
+                    "silence_gate": config.silence_gate,
+                },
+            })
+            pump = asyncio.create_task(pump_windows())
+
+        async def _shutdown() -> None:
+            """先让驱动停下来，再收尾。
+
+            刻意**不是** ``pump.cancel()``：取消一个正卡在 ``run_in_executor`` 里的任务
+            只会让它停止等待，那个工作线程还在改 Stitcher 与 SessionStore，而 ``close()``
+            紧接着就在另一个线程里做同样的事——这正是 ``RealtimeSession`` 文档里那条
+            "两者不得并发"的契约。信号 + await 让当前窗口跑完再退出，收尾因此是串行的。
+            """
+            nonlocal session, pump
+            if session is None:
+                return
+            if pump is not None:
+                stopping.set()
+                try:
+                    await pump
+                except Exception:                               # 驱动已经自己报过错
+                    pass
+                pump = None
+            current, current_id = session, session_id
+            session = None
+            for event in await current.close():
+                await _send(event)
+            if current_id is not None:
+                registry.drop(current_id)
+
+        try:
+            while True:
+                message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    break
+                if (data := message.get("bytes")) is not None:
+                    if len(data) % 4 != 0:
+                        await _send({
+                            "type": "error",
+                            "code": "invalid_audio_frame",
+                            "detail": f"expected float32 little-endian frames, got {len(data)} bytes",
+                        })
+                        continue
+                    frame = np.frombuffer(data, dtype="<f4")
+                    if session is None:
+                        pending.append(frame)                   # start 之前先攒着，不丢
+                        _trim_pending(pending, pending_limit)
+                    else:
+                        session.push_audio(frame)
+                    continue
+                text = message.get("text")
+                if text is None:
+                    continue
+                try:
+                    command = json.loads(text)
+                except json.JSONDecodeError:
+                    await _send({"type": "error", "code": "invalid_json", "detail": text[:120]})
+                    continue
+                if not isinstance(command, dict):
+                    await _send({"type": "error", "code": "invalid_json", "detail": text[:120]})
+                    continue
+                kind = str(command.get("type") or "")
+                if kind == "start":
+                    await _start(command)
+                elif kind == "stop":
+                    break
+                elif kind == "rename_speaker":
+                    if session is None:
+                        await _send({"type": "error", "code": "no_session", "detail": kind})
+                        continue
+                    try:
+                        session.rename_speaker(
+                            str(command.get("speaker_id")), str(command.get("name") or "")
+                        )
+                    except KeyError:
+                        await _send({"type": "error", "code": "unknown_speaker",
+                                     "detail": str(command.get("speaker_id"))})
+                        continue
+                    await _send({"type": "speaker", "speakers": session.speakers()})
+                elif kind in ("set_prompt", "set_hotwords"):
+                    if session is None:
+                        await _send({"type": "error", "code": "no_session", "detail": kind})
+                        continue
+                    base = str(command.get("prompt") or session.prompt)
+                    session.set_prompt(_with_hotwords(base, command.get("hotwords")))
+                elif kind == "reassign_segment":
+                    if session is None:
+                        await _send({"type": "error", "code": "no_session", "detail": kind})
+                        continue
+                    updated = session.reassign_speaker(
+                        str(command.get("segment_id")), str(command.get("speaker_id"))
+                    )
+                    if updated is None:
+                        await _send({"type": "error", "code": "unknown_segment",
+                                     "detail": str(command.get("segment_id"))})
+                        continue
+                    # 客户端对 committed 是"增量追加"语义；同一个 id 再来一次即原地替换
+                    await _send({"type": "committed", "segments": [updated.to_dict()]})
+                    await _send({"type": "speaker", "speakers": session.speakers()})
+                else:
+                    await _send({"type": "error", "code": "unknown_command", "detail": kind})
+        except WebSocketDisconnect:
+            pass
+        finally:
+            await _shutdown()
+
     return app
 
 
-def _transcriber_info(transcriber_factory: Callable[[], Any]) -> dict[str, Any]:
-    """尽量在不构造转写器的前提下描述后端。"""
-    return {"factory": getattr(transcriber_factory, "__name__", repr(transcriber_factory))}
+def _transcriber_info(
+    transcriber_factory: Callable[[], Any],
+    probe: Callable[[], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """尽量在不构造转写器的前提下描述后端。
+
+    ``probe`` 由 CLI 注入（``--backend vllm`` 时是一次到端点的短探测）。**它抛异常
+    也只是一条信息**：忘起 vLLM 是最常见的一次失误，而"服务本身还在不在"不该因为这个
+    探测失败而变成 500。
+    """
+    info: dict[str, Any] = {"factory": getattr(transcriber_factory, "__name__", repr(transcriber_factory))}
+    if probe is None:
+        return info
+    try:
+        info.update(probe())
+    except Exception as exc:                                  # noqa: BLE001
+        info["reachable"] = False
+        info["detail"] = f"{type(exc).__name__}: {exc}"
+    return info

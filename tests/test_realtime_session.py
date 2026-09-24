@@ -894,5 +894,83 @@ class SilenceGateTest(unittest.TestCase):
         self.assertEqual(spans, [(60.0, 80.0), (60.0, 80.0)])
 
 
+class _StubEmbedder:
+    """确定性向量，够让说话人表真的建起来。"""
+
+    embedding_dim = 2
+
+    def embed(self, audio, sample_rate):
+        return np.array([1.0, 0.0], dtype=np.float32)
+
+
+class PublicControlSurfaceTest(unittest.TestCase):
+    """服务层不再伸进私有属性——这些就是它要用的那组公开入口。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.runs = Path(self._tmp.name) / "runs"
+
+    def _session(self, **kwargs) -> RealtimeSession:
+        return RealtimeSession(
+            _config(),
+            transcriber=ScriptedTranscriber(["[1][S01]你好[2]"] * 4),
+            store=SessionStore(self.runs, "s1"),
+            **kwargs,
+        )
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def test_prompt_can_be_read_and_replaced(self):
+        session = self._session()
+        self.assertTrue(session.prompt)
+
+        session.set_prompt("新 prompt")
+
+        self.assertEqual(session.prompt, "新 prompt")
+
+    def test_setting_an_empty_prompt_keeps_the_current_one(self):
+        session = self._session()
+        before = session.prompt
+
+        session.set_prompt("")
+
+        self.assertEqual(session.prompt, before)
+
+    def test_speakers_is_empty_without_an_embedder(self):
+        self.assertEqual(self._session().speakers(), [])
+
+    def test_renaming_an_unknown_speaker_raises(self):
+        with self.assertRaises(KeyError):
+            self._session().rename_speaker("S99", "谁")
+
+    def test_reassigning_an_unknown_segment_returns_none(self):
+        self.assertIsNone(self._session().reassign_speaker("seg-999", "S01"))
+
+    def test_reassigning_rewrites_the_stored_row(self):
+        session = self._session()
+        session.push_audio(_speech(8.0))
+        self._run(session.run_pending())
+        segment_id = session.committed[0].id
+
+        updated = session.reassign_speaker(segment_id, "U99")
+
+        self.assertEqual(updated.speaker_id, "U99")
+        rows = SessionStore.load_committed(self.runs, "s1")
+        self.assertEqual([row["speaker"] for row in rows], ["U99"])
+
+    def test_reassigning_uses_the_renamed_display_name(self):
+        session = self._session(embedder=_StubEmbedder())
+        session.push_audio(_speech(8.0))
+        self._run(session.run_pending())
+        segment = session.committed[0]
+        session.rename_speaker(segment.speaker_id, "张总")
+
+        updated = session.reassign_speaker(segment.id, segment.speaker_id)
+
+        self.assertEqual(updated.speaker_name, "张总")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -231,6 +231,49 @@ class RealtimeSession:
         events.append({"type": "speaker", "speakers": self._gallery.speakers()})
         self._closed = True
         return events
+
+    # --- 公开的转写与说话人控制面 ---
+    #
+    # 服务层（WebSocket 控制指令）需要改 prompt、改说话人显示名、改某一段的说话人。
+    # 没有这组方法时它只能伸进 ``_prompt`` / ``_gallery`` / ``_committed`` 这些私有属性
+    # ——阶段一为 ``_gallery.rename`` 破过一次例，那是欠债。这组方法就是把那笔债还掉：
+    # 会话自己拥有它的转写与说话人表。
+
+    @property
+    def prompt(self) -> str:
+        return self._prompt
+
+    def set_prompt(self, prompt: str) -> None:
+        """换掉后续窗口用的 prompt。
+
+        只影响**之后**的窗口；已经定稿的内容不会被改写——这与"定稿永不回改"一致。
+        """
+        self._prompt = str(prompt or self._prompt)
+
+    def speakers(self) -> list[dict]:
+        return self._gallery.speakers()
+
+    def rename_speaker(self, speaker_id: str, name: str) -> None:
+        """给全局说话人一个显示名。未知 id 抛 ``KeyError``。"""
+        self._gallery.rename(speaker_id, name)
+
+    def reassign_speaker(self, segment_id: str, speaker_id: str) -> CommittedSegment | None:
+        """把一条已定稿段落改到另一个说话人，并**立刻落盘**。
+
+        不落盘的话重开会话就丢了——而导出读的正是那份文件。找不到该 id 返回 ``None``。
+        """
+        for index, item in enumerate(self._committed):
+            if item.id != segment_id:
+                continue
+            updated = replace(
+                item,
+                speaker_id=speaker_id,
+                speaker_name=self._gallery.display_name(speaker_id),
+            )
+            self._committed[index] = updated
+            self._store.rewrite_committed(self._committed)
+            return updated
+        return None
 
     # --- 内部 ---
 

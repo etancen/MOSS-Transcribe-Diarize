@@ -78,6 +78,38 @@ def extract_transcription_text(response: dict[str, Any]) -> str:
     return content.strip() if isinstance(content, str) else ""
 
 
+def check_endpoint(
+    base_url: str,
+    *,
+    api_key: str = "EMPTY",
+    timeout: float = 2.0,
+) -> dict[str, Any]:
+    """探一下端点是否活着，供 ``/api/runtime`` 报告连通性。
+
+    用户忘了先起 vLLM 服务是这条路上最常见的一次失误，而它现在的表现是"每跑一窗
+    失败一次"——那要到第一次推理才看得见。这里用 ``/v1/models`` 做一次**短超时**
+    的 GET，让服务在开始之前就能把话说清楚。
+
+    **绝不抛异常**：探测失败是它要报告的结果，不是它的错误。
+    """
+    base = base_url.rstrip("/")
+    if base.endswith("/audio/transcriptions"):
+        base = base[: -len("/audio/transcriptions")]
+    url = base + "/models"
+    request = urllib.request.Request(url, method="GET")
+    if api_key:
+        request.add_header("Authorization", f"Bearer {api_key}")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            if 200 <= response.status < 300:
+                return {"reachable": True, "detail": f"GET {url} -> {response.status}"}
+            return {"reachable": False, "detail": f"GET {url} -> {response.status}"}
+    except urllib.error.HTTPError as exc:
+        return {"reachable": False, "detail": f"GET {url} -> HTTP {exc.code}"}
+    except Exception as exc:                                  # 连接被拒、超时、DNS……
+        return {"reachable": False, "detail": f"GET {url} -> {type(exc).__name__}: {exc}"}
+
+
 def consume_sse_transcription(
     response: Iterable[bytes],
     *,
