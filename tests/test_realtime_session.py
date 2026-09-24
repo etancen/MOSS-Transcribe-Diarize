@@ -49,6 +49,21 @@ class FailingTranscriber:
         raise RuntimeError(self.message)
 
 
+class FlakyEmbedder:
+    """第一次嵌入抛异常，之后正常。用于验证定稿失败后的回滚。"""
+
+    embedding_dim = 2
+
+    def __init__(self):
+        self.calls = 0
+
+    def embed(self, audio, sample_rate):
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("声纹模型挂了")
+        return np.array([1.0, 0.0], dtype=np.float32)
+
+
 def _config(**kwargs) -> RealtimeConfig:
     params = {
         "window": 20.0,
@@ -496,6 +511,82 @@ class RealtimeSessionTest(unittest.TestCase):
 
         self.assertEqual(session.committed, [])
         self.assertEqual(session._buffer.total_seconds, 0.0)
+
+
+class FailedCommitTest(unittest.TestCase):
+    """定稿（声纹嵌入 + 落盘）抛异常时，水位线不得越过没有落盘的内容。
+
+    ``Stitcher.ingest`` / ``flush`` 会**先**推进水位线、**后**由调用方定稿。定稿失败
+    而水位线已经越过这些段落时，后续窗口会按"已定稿"或"跨水位线"把它们丢掉——那不是
+    暂时性丢失，而是永久丢失，且没有任何重试能救回来。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.runs = Path(self._tmp.name) / "runs"
+
+    def _session(self, transcriber, embedder) -> RealtimeSession:
+        return RealtimeSession(
+            _config(),
+            transcriber=transcriber,
+            store=SessionStore(self.runs, "s1"),
+            embedder=embedder,
+        )
+
+    def test_a_failed_commit_does_not_let_the_watermark_pass_the_content(self):
+        transcriber = ScriptedTranscriber(["[1][S01]你好[2]", "[1][S01]你好[2]"])
+        session = self._session(transcriber, FlakyEmbedder())
+        session.push_audio(_speech(8.0))
+
+        first = asyncio.run(session.run_pending())
+        self.assertEqual([event["type"] for event in first], ["error", "status"])
+        self.assertEqual(session.committed, [])
+
+        # 第二窗是 [0, 14]，覆盖同一段音频。第一次的 ingest 已经把水位线推到 2.0；若不
+        # 回滚，这段会命中"已定稿"规则被丢弃，此后任何窗口都救不回来。
+        session.push_audio(_speech(6.0))
+        second = asyncio.run(session.run_pending())
+
+        committed = [
+            seg
+            for event in second
+            if event["type"] == "committed"
+            for seg in event["segments"]
+        ]
+        self.assertEqual([seg["text"] for seg in committed], ["你好"])
+        self.assertEqual(
+            [row["text"] for row in SessionStore.load_committed(self.runs, "s1")], ["你好"]
+        )
+
+    def test_a_failed_teardown_commit_keeps_the_tail_recoverable(self):
+        """close() 的收尾定稿失败后，重试必须还能把临时区定稿。
+
+        三个回复都相同，收尾那一窗只产出临时段，于是嵌入器唯一的一次调用来自 teardown
+        的 flush（逐窗路径的 committed 是空的，_commit 直接返回）。若不回滚，重试时
+        ingest 会把这段按"已定稿"丢掉、flush 返回空表，close() 顺利返回、内容静默消失。
+        """
+        transcriber = ScriptedTranscriber(["[18][S01]结尾[19]"] * 3)
+        session = self._session(transcriber, FlakyEmbedder())
+        session.push_audio(_speech(20.0))
+        asyncio.run(session.run_pending())
+
+        with self.assertRaises(RuntimeError):
+            asyncio.run(session.close())
+        self.assertFalse(session.closed)
+
+        events = asyncio.run(session.close())
+
+        committed = [
+            seg
+            for event in events
+            if event["type"] == "committed"
+            for seg in event["segments"]
+        ]
+        self.assertEqual([seg["text"] for seg in committed], ["结尾"])
+        self.assertEqual(
+            [row["text"] for row in SessionStore.load_committed(self.runs, "s1")], ["结尾"]
+        )
 
 
 class SilenceGateTest(unittest.TestCase):

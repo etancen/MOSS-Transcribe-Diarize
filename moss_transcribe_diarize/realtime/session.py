@@ -184,8 +184,19 @@ class RealtimeSession:
         的段落。在工作线程里改 stitcher / gallery / store / 段落计数器是安全的，理由
         与 ``_process_window`` 相同——一次会话里这些状态只被串行触碰。
         """
+        before_until = self._stitcher.committed_until
+        before_provisional = self._stitcher.provisional
         remaining = self._stitcher.flush()
-        newly = self._commit(remaining, window_audio, window_start)
+        try:
+            newly = self._commit(remaining, window_audio, window_start)
+        except Exception:
+            # flush() 已经推过水位线、清空了临时快照，但内容还没落盘（_commit 里才有
+            # 声纹嵌入与追加）。不回滚的话，调用方重试 close() 时 ingest 会按"已定稿"
+            # 把同一段丢掉——静默、且不可恢复。
+            self._stitcher.restore_after_failed_commit(before_until, before_provisional)
+            raise
+        # finalize 刻意不在回滚范围内：_commit 已经成功，内容确实落盘了；这时回滚只会
+        # 让下一次 close() 把同一段再定稿一遍。
         self._store.finalize(self._gallery.speakers())
         return bool(remaining), newly
 
@@ -245,13 +256,25 @@ class RealtimeSession:
         audio: np.ndarray,
     ) -> tuple[list[CommittedSegment], list[Segment]]:
         raw = self._transcriber.transcribe_window(audio, prompt=self._prompt)
+        # ingest 会推进水位线并替换临时快照，但内容此时还没落盘（嵌入与追加都在
+        # _commit 里）。先记下这两块状态，定稿失败时回滚——否则水位线已经越过这些
+        # 段落，下一个窗口会按"已定稿"或"跨水位线"把它们丢掉，内容永久消失，且没有
+        # 任何重试能救回来。
+        before_until = self._stitcher.committed_until
+        before_provisional = self._stitcher.provisional
         result = self._stitcher.ingest(
             window_start=start,
             window_end=end,
             raw_text=raw,
             window_id=window_id,
         )
-        committed = self._commit(result.committed, audio, start)
+        try:
+            committed = self._commit(result.committed, audio, start)
+        except Exception:
+            # write_provisional 不在回滚范围内：_commit 成功就说明内容已经落盘，回滚
+            # 只会让下一个窗口重复定稿。
+            self._stitcher.restore_after_failed_commit(before_until, before_provisional)
+            raise
         self._store.write_provisional(result.provisional)
         return committed, result.provisional
 

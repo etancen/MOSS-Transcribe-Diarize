@@ -153,3 +153,17 @@ class Stitcher:
         if remaining:
             self._committed_until = max(self._committed_until, remaining[-1].end)
         return remaining
+
+    def restore_after_failed_commit(self, committed_until: float, provisional: list[Segment]) -> None:
+        """把水位线与临时快照回滚到调用方事先捕获的值。
+
+        存在的理由只有一个：``ingest`` / ``flush`` 会**先**推进水位线、**后**由调用方
+        走定稿路径（声纹嵌入 + 落盘）。那一步可能失败，而水位线一旦越过这些段落，后续
+        窗口就会按"已定稿"或"跨水位线"把它们丢掉——内容永久消失，且没有任何重试能救回
+        来。所以定稿失败时必须把这两块状态放回去，让下一个窗口重新覆盖同一段音频。
+
+        约定：这两个参数应当是**同一次**成功的 ingest/flush 之前捕获的
+        ``committed_until`` 与 ``provisional``（后者用属性取到的副本即可）。
+        """
+        self._committed_until = float(committed_until)
+        self._provisional = list(provisional)
