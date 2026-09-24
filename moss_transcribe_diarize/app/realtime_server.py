@@ -31,6 +31,17 @@ from moss_transcribe_diarize.realtime.store import SessionStore
 
 STATIC_DIR = Path(__file__).with_name("static")
 
+_MEDIA_TYPES = {
+    ".js": "text/javascript",
+    ".mjs": "text/javascript",
+    ".css": "text/css",
+    ".json": "application/json",
+    ".svg": "image/svg+xml",
+    ".html": "text/html",
+    ".ico": "image/x-icon",
+    ".png": "image/png",
+}
+
 MAX_PENDING_SECONDS = 60.0
 """``start`` 之前最多代管多少秒音频。
 
@@ -137,6 +148,20 @@ def create_realtime_app(
         if not page.exists():
             return HTMLResponse("<h1>MOSS Realtime</h1><p>realtime.html 尚未提供。</p>")
         return HTMLResponse(page.read_text(encoding="utf-8"), headers={"Cache-Control": "no-store"})
+
+    @app.get("/assets/{asset_path:path}")
+    def asset(asset_path: str):
+        """前端的 js/css/词条出口。
+
+        ``resolve()`` 之后再比对父目录是这里的守卫：URL 段原样进来，直接拼路径就是
+        任意文件读取。解析后再比，``..%2F..%2Fsecret.txt`` 落不到 assets 里。
+        """
+        root = assets.resolve()
+        target = (root / asset_path).resolve()
+        if not target.is_file() or root not in target.parents:
+            return JSONResponse({"detail": "asset not found"}, status_code=404)
+        media = _MEDIA_TYPES.get(target.suffix.lower(), "application/octet-stream")
+        return FileResponse(target, media_type=media)
 
     @app.get("/api/runtime")
     def runtime():

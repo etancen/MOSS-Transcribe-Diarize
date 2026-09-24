@@ -680,5 +680,55 @@ class RetranscribeTest(unittest.TestCase):
         self.assertEqual(response.json()["code"], "audio_missing")
 
 
+class StaticAssetTest(unittest.TestCase):
+    """前端要的 .js / .css / .json 得有出口，且出口不能变成任意文件读取。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.assets = root / "assets"
+        self.assets.mkdir(parents=True)
+        (self.assets / "realtime.html").write_text("<!doctype html><title>rt</title>", encoding="utf-8")
+        (self.assets / "realtime.js").write_text("export const x = 1;", encoding="utf-8")
+        (self.assets / "audio-worklet.js").write_text("registerProcessor('x', class {});", encoding="utf-8")
+        (self.assets / "realtime.css").write_text("body { margin: 0 }", encoding="utf-8")
+        (self.assets / "locales").mkdir()
+        (self.assets / "locales" / "zh-CN.json").write_text('{"a": "b"}', encoding="utf-8")
+        (root / "secret.txt").write_text("nope", encoding="utf-8")
+        self.client = TestClient(_app(root, static_dir=self.assets))
+
+    def test_serves_the_frontend_files_with_useful_content_types(self):
+        for name, media in (
+            ("realtime.js", "text/javascript"),
+            ("audio-worklet.js", "text/javascript"),
+            ("realtime.css", "text/css"),
+            ("locales/zh-CN.json", "application/json"),
+        ):
+            with self.subTest(name=name):
+                response = self.client.get(f"/assets/{name}")
+                self.assertEqual(response.status_code, 200)
+                self.assertIn(media, response.headers["content-type"])
+
+    def test_serves_the_page_at_the_root(self):
+        response = self.client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("<title>rt</title>", response.text)
+
+    def test_a_missing_asset_is_404(self):
+        self.assertEqual(self.client.get("/assets/nope.js").status_code, 404)
+
+    def test_a_directory_is_404_not_a_listing(self):
+        self.assertEqual(self.client.get("/assets/locales").status_code, 404)
+
+    def test_a_traversal_attempt_cannot_read_outside_the_assets_dir(self):
+        for attempt in ("..%2F..%2Fsecret.txt", "..%2Fsecret.txt", "%2e%2e%2f%2e%2e%2fsecret.txt"):
+            with self.subTest(attempt=attempt):
+                response = self.client.get(f"/assets/{attempt}")
+                self.assertIn(response.status_code, (400, 404))
+                self.assertNotIn("nope", response.text)
+
+
 if __name__ == "__main__":
     unittest.main()
