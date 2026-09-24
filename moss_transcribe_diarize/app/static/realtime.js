@@ -90,6 +90,18 @@ export function shouldFollow(container, threshold = FOLLOW_THRESHOLD_PX) {
   return distance <= threshold;
 }
 
+/**
+ * 定稿区里所有属于某个说话人的段落 id。
+ *
+ * 用于"改一段可批量应用到同组"（spec §4.4 把手工改归属称为必要补偿，§5.2 要求下拉旁
+ * 可勾选）。前端的"组"就是**当前归属于这个说话人的全部段**——用户改一次归属的意图是
+ * "这个人其实是那位"，而不是"这一段特殊"。
+ */
+export function segmentsForSpeaker(segments, speakerId) {
+  return (segments || []).filter((segment) => segment.speaker === speakerId)
+    .map((segment) => segment.id);
+}
+
 // ---------------------------------------------------------------- 应用
 
 const state = {
@@ -102,6 +114,7 @@ const state = {
   sending: false,
   paused: false,
   phase: "idle",
+  applyToAll: false,
   droppedFrames: 0,
   clockTimer: null,
   startedAt: 0,
@@ -151,6 +164,9 @@ function setPhase(phase) {
   if (!dom.statePill) return;
   dom.statePill.textContent = t(STATE_MESSAGES[phase] || STATE_MESSAGES.idle);
   dom.statePill.dataset.tone = phase === "live" ? "good" : "";
+  // 会话还在录的时候重跑读到的是一份半成品录音，服务端会 409；按钮先禁掉，别让用户
+  // 点出一条注定失败的请求。
+  if (dom.retranscribeButton) dom.retranscribeButton.disabled = phase === "live";
 }
 
 // ---------------------------------------------------------------- 渲染
@@ -215,10 +231,28 @@ function speakerPicker(segment) {
     option.selected = id === segment.speaker;
     select.appendChild(option);
   }
+  const applyAll = document.createElement("input");
+  applyAll.type = "checkbox";
+  applyAll.className = "apply-all";
+  applyAll.checked = state.applyToAll;
+  applyAll.setAttribute("aria-label", t("realtime.speaker.applyToAll"));
+  applyAll.addEventListener("change", () => { state.applyToAll = applyAll.checked; });
+
   select.addEventListener("change", () => {
-    send({ type: "reassign_segment", segment_id: segment.id, speaker_id: select.value });
+    const from = segment.speaker;
+    const to = select.value;
+    const ids = applyAll.checked ? segmentsForSpeaker(state.committed, from) : [segment.id];
+    for (const id of ids) {
+      send({ type: "reassign_segment", segment_id: id, speaker_id: to });
+    }
   });
   wrap.appendChild(select);
+
+  const label = document.createElement("label");
+  label.className = "apply-all-label";
+  label.title = t("realtime.speaker.applyToAll");
+  label.append(applyAll, document.createTextNode(t("realtime.speaker.applyToAll")));
+  wrap.appendChild(label);
 
   const rename = document.createElement("button");
   rename.type = "button";
@@ -332,10 +366,16 @@ function killAudio() {
     for (const stop of state.audio.stops) {
       try { stop(); } catch (err) { /* 已经停了 */ }
     }
+    // 轨道必须显式 stop：不 stop 的话浏览器标签页上的录音指示会一直亮着。
+    for (const source of state.audio.sources.values()) {
+      for (const track of source.stream.getTracks()) {
+        try { track.stop(); } catch (err) { /* 已经停了 */ }
+      }
+    }
+    state.audio.sources.clear();
     try { state.audio.context.close(); } catch (err) { /* 已经关了 */ }
   }
   state.audio = null;
-  state.levels = null;
 }
 
 async function ensureAudio() {
@@ -487,17 +527,27 @@ function openSocket() {
     state.socket = null;
     state.sending = false;
     state.paused = false;
+    window.clearInterval(state.clockTimer);       // 否则"已录"在掉线后一直涨
+    state.clockTimer = null;
     setPhase("stopped");
     dom.startButton.disabled = false;
     dom.pauseButton.disabled = true;
     dom.stopButton.disabled = true;
+    dom.pauseButton.textContent = t("realtime.controls.pause");
   });
   socket.addEventListener("error", () => notice("realtime.notice.wsClosed"));
   return socket;
 }
 
 async function start() {
+  // 这道守卫必须在**任何 await 之前**立起来。放在后面的话，浏览器弹麦克风授权框期间
+  // 用户再点一次"开始"就能穿过去：第二条 WebSocket 被建出来，`state.socket` 指向新的
+  // 那条、旧的那条再没有代码能引用到它——服务端那条会话永远收不到 stop，麦克风也被接进
+  // 混音两遍。
   if (state.sending) return;
+  state.sending = true;
+  dom.startButton.disabled = true;
+
   state.committed = [];
   state.provisional = [];
   state.roster = new Map();
@@ -511,15 +561,15 @@ async function start() {
   await enableMicrophone();
   if (!state.audio || !state.audio.sources.size) {
     notice("realtime.notice.needSource");
+    state.sending = false;
+    dom.startButton.disabled = false;
     return;
   }
   state.socket = openSocket();
   state.startedAt = Date.now();
-  state.sending = true;
   const name = (dom.sessionName?.value || "").trim();
   state.socket.addEventListener("open", () => {
     send({ type: "start", session_name: name });
-    dom.startButton.disabled = true;
     dom.pauseButton.disabled = false;
     dom.stopButton.disabled = false;
   });
@@ -532,10 +582,18 @@ async function start() {
 async function stop() {
   if (!state.socket) return;
   send({ type: "stop" });
-  // 收尾那几段在 stop **之后**才由服务端发出（它还要跑完一个完整窗口），所以这里
-  // 等服务端关连接，而不是到点就断开——否则最后几句话看不见，而盘上是有的。
-  window.clearInterval(state.clockTimer);
+  // 收尾那几段在 stop **之后**才由服务端发出（它还要跑完一个完整窗口），所以监听不动，
+  // 等服务端关连接——连接关闭时会复位状态与时钟。
   state.sending = false;
+  state.paused = false;
+  window.clearInterval(state.clockTimer);        // 连接关闭时还会再清一次，幂等
+  state.clockTimer = null;
+  // 把麦克风真的放掉：只是不再发帧的话，浏览器标签页上的录音指示会一直亮着，而这是个
+  // 记录会议的工具——"停止"应当确实停止采集。
+  killAudio();
+  dom.micButton?.classList.remove("active", "muted");
+  dom.systemButton?.classList.remove("active", "muted");
+  dom.pauseButton.textContent = t("realtime.controls.pause");
 }
 
 function togglePause() {
@@ -613,10 +671,22 @@ async function retranscribe() {
   if (!state.sessionId) return;
   dom.retranscribePanel.hidden = false;
   dom.retranscribeText.textContent = t("realtime.retranscribe.running");
-  const response = await fetch(`/api/sessions/${state.sessionId}/retranscribe`, { method: "POST" });
+  let response;
+  try {
+    response = await fetch(`/api/sessions/${state.sessionId}/retranscribe`, { method: "POST" });
+  } catch (err) {
+    // 网络断了 / 服务重启：不接住的话面板会永远停在"正在重跑…"。
+    dom.retranscribeText.textContent = t("realtime.notice.error", { detail: String(err) });
+    return;
+  }
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
-    dom.retranscribeText.textContent = localizedError(payload, "errors.retranscribe_failed");
+    const friendly = localizedError(payload, "errors.retranscribe_failed");
+    // 词汇表只给一句话，而**为什么**失败（模型路径、显存、录音坏了）全在 detail 里。
+    // 只说"重跑失败。"等于把用户唯一的线索丢掉。
+    dom.retranscribeText.textContent = payload.detail
+      ? `${friendly}\n\n${payload.detail}`
+      : friendly;
     return;
   }
   dom.retranscribeText.textContent = payload.text || t("realtime.retranscribe.empty");
@@ -702,7 +772,8 @@ window.mtdRealtime = {
     for (const event of events) handleEvent(event);
   },
   reloadRuntime: loadRuntime,
-  helpers: { formatClock, speakerColor, speakerIndex, mergeCommitted, applyRename, shouldFollow },
+  helpers: { formatClock, speakerColor, speakerIndex, mergeCommitted, applyRename,
+             shouldFollow, segmentsForSpeaker },
   state: () => ({
     sessionId: state.sessionId,
     committed: state.committed.length,

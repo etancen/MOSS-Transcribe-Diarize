@@ -20,14 +20,25 @@ import soundfile as sf
 ProgressCallback = Callable[[int], None]
 
 
-def transcriptions_url(base_url: str) -> str:
-    """把用户给的 base_url 归一成 /v1/audio/transcriptions 的完整地址。"""
+def _api_root(base_url: str) -> str:
+    """把用户给的 base_url 归一成 OpenAI 兼容 API 的根（含 ``/v1``）。
+
+    **所有对外请求都必须走这里**：探测与请求各拼各的，就会出现"转写请求走
+    ``/v1/audio/transcriptions`` 而连通性探测打 ``/models``"这种自相矛盾——服务明明是好的，
+    页面却报"后端不可达"。vLLM / SGLang 只在 ``/v1`` 下注册 OpenAI 兼容路由，裸 ``/models``
+    是 404。
+    """
     base = base_url.rstrip("/")
     if base.endswith("/audio/transcriptions"):
-        return base
+        base = base[: -len("/audio/transcriptions")].rstrip("/")
     if base.endswith("/v1"):
-        return base + "/audio/transcriptions"
-    return base + "/v1/audio/transcriptions"
+        return base
+    return base + "/v1"
+
+
+def transcriptions_url(base_url: str) -> str:
+    """把用户给的 base_url 归一成 /v1/audio/transcriptions 的完整地址。"""
+    return _api_root(base_url) + "/audio/transcriptions"
 
 
 def encode_wav_bytes(pcm: np.ndarray, sample_rate: int = 16000) -> bytes:
@@ -92,10 +103,7 @@ def check_endpoint(
 
     **绝不抛异常**：探测失败是它要报告的结果，不是它的错误。
     """
-    base = base_url.rstrip("/")
-    if base.endswith("/audio/transcriptions"):
-        base = base[: -len("/audio/transcriptions")]
-    url = base + "/models"
+    url = _api_root(base_url) + "/models"
     request = urllib.request.Request(url, method="GET")
     if api_key:
         request.add_header("Authorization", f"Bearer {api_key}")

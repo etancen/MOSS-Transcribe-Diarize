@@ -49,12 +49,12 @@ class _Row:
 
 
 def _app(tmp: Path, *, embedder=None, probe=None, record_audio=True, retranscribe=None,
-         static_dir=None, **config_kwargs):
+         static_dir=None, factory=None, **config_kwargs):
     from moss_transcribe_diarize.app.realtime_server import create_realtime_app
 
     created: list[ScriptedTranscriber] = []
 
-    def factory() -> ScriptedTranscriber:
+    def build() -> ScriptedTranscriber:
         instance = ScriptedTranscriber()
         created.append(instance)
         return instance
@@ -62,7 +62,7 @@ def _app(tmp: Path, *, embedder=None, probe=None, record_audio=True, retranscrib
     config = RealtimeConfig(silence_gate=False, **config_kwargs)
     app = create_realtime_app(
         config=config,
-        transcriber_factory=factory,
+        transcriber_factory=factory or build,
         embedder=embedder,
         probe=probe,
         record_audio=record_audio,
@@ -656,9 +656,11 @@ class RetranscribeTest(unittest.TestCase):
 
     def test_the_sessions_own_prompt_is_reused(self):
         """重跑必须用实时那次用过的 prompt，否则重跑出来的内容与当场那次不是一回事。"""
-        SessionStore(self.runs, "s1", name="周会").write_meta(prompt="只转写中文")
-        seen = []
+        store = SessionStore(self.runs, "s1", name="周会")
+        store.write_meta(prompt="只转写中文")
+        store.finalize([])          # 重开会话会把状态写回 recording，这里再收一次尾
 
+        seen = []
         self._client(lambda path, prompt: seen.append(prompt) or "x").post(
             "/api/sessions/s1/retranscribe"
         )
@@ -728,6 +730,294 @@ class StaticAssetTest(unittest.TestCase):
                 response = self.client.get(f"/assets/{attempt}")
                 self.assertIn(response.status_code, (400, 404))
                 self.assertNotIn("nope", response.text)
+
+class BackendFailureTest(unittest.TestCase):
+    """后端起不来（模型路径写错、显存不够）必须是可观测的失败。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self._tmp.cleanup)
+        self.runs = Path(self._tmp.name) / "runs"
+
+    def _client(self, factory):
+        return TestClient(_app(Path(self._tmp.name), embedder=StubEmbedder(), factory=factory))
+
+    def test_a_failing_factory_is_reported_not_swallowed(self):
+        def boom():
+            raise RuntimeError("model weights not found at /nope")
+
+        with self._client(boom).websocket_connect("/ws/realtime") as ws:
+            ws.send_json({"type": "start", "session_name": "现场会"})
+            first = ws.receive_json()
+
+        self.assertEqual(first["type"], "error")
+        self.assertEqual(first["code"], "backend_unavailable")
+        self.assertIn("model weights not found", first["detail"])
+
+    def test_a_failing_factory_leaves_no_ghost_session_behind(self):
+        """否则历史里会多出一条永远停在 recording、既没录音也没转写的会话。"""
+        def boom():
+            raise RuntimeError("out of memory")
+
+        with self._client(boom).websocket_connect("/ws/realtime") as ws:
+            ws.send_json({"type": "start", "session_name": "现场会"})
+            ws.receive_json()
+
+        self.assertEqual(
+            [p.name for p in self.runs.iterdir()] if self.runs.is_dir() else [], []
+        )
+
+
+class ControlCommandsAreSerializedTest(unittest.TestCase):
+    """会话有三个写者：驱动、收尾、控制指令。
+
+    `reassign_segment` 的 `rewrite_committed` 是**整体重写** `transcript.jsonl`，撞上正在
+    追加的窗口就会把刚定稿的那段永久抹掉——不报任何错。这条测试钉住那个不变量：窗口在飞
+    的时候，控制指令不许改动会话。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self._tmp.cleanup)
+        self.runs = Path(self._tmp.name) / "runs"
+
+    def test_a_rename_never_lands_while_a_window_is_in_flight(self):
+        import threading
+        from unittest import mock
+
+        from moss_transcribe_diarize.realtime.session import RealtimeSession
+
+        gate = threading.Event()
+        entered_second = threading.Event()
+
+        class BlockingTranscriber:
+            def __init__(self):
+                self.calls = 0
+
+            def transcribe_window(self, audio, *, prompt):
+                self.calls += 1
+                if self.calls == 1:
+                    return SCRIPTED_REPLY
+                entered_second.set()
+                gate.wait(20)
+                return "[1.0][S01]第二段[2.0]"
+
+        window_open = threading.Event()
+        offenders: list = []
+        real_run_pending = RealtimeSession.run_pending
+        real_rename = RealtimeSession.rename_speaker
+
+        async def watched_run_pending(self):
+            window_open.set()
+            try:
+                return await real_run_pending(self)
+            finally:
+                window_open.clear()
+
+        def watched_rename(self, speaker_id, name):
+            if window_open.is_set():
+                offenders.append((speaker_id, name))
+            return real_rename(self, speaker_id, name)
+
+        blocker = BlockingTranscriber()
+        client = TestClient(
+            _app(Path(self._tmp.name), embedder=StubEmbedder(), factory=lambda: blocker)
+        )
+
+        with mock.patch.object(RealtimeSession, "run_pending", watched_run_pending), \
+                mock.patch.object(RealtimeSession, "rename_speaker", watched_rename):
+            with client.websocket_connect("/ws/realtime") as ws:
+                ws.send_json({"type": "start"})
+                session_id = ws.receive_json()["session_id"]
+                ws.send_bytes(_pcm_bytes(9.0))
+                self._drain(ws, want="committed")
+
+                ws.send_bytes(_pcm_bytes(9.0))
+                self.assertTrue(entered_second.wait(20), "第二个窗口没跑起来")
+
+                ws.send_json({"type": "rename_speaker", "speaker_id": "S01", "name": "张总"})
+                time.sleep(0.4)          # 不阻塞的话，这条指令此刻已经改完会话了
+                gate.set()
+                self._drain(ws, want="speaker",
+                            where=lambda e: any(i["name"] == "张总" for i in e["speakers"]))
+                ws.send_json({"type": "stop"})
+                # 收尾要在还留在 with 里时等完：TestClient 退出 with 时会取消应用任务。
+                self.assertTrue(self._wait_until(
+                    lambda: SessionStore.load_meta(self.runs, session_id).get("status") == "done"
+                ))
+
+        self.assertEqual(offenders, [], "控制指令在窗口在飞的时候改了会话")
+
+    def _drain(self, ws, *, want, where=None, limit=80):
+        for _ in range(limit):
+            event = ws.receive_json()
+            if event["type"] == want and (where is None or where(event)):
+                return event
+        self.fail(f"没有收到 {want} 事件")
+
+    def _wait_until(self, predicate, *, timeout=20.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.02)
+        return False
+
+
+class RenameIsPersistedTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self._tmp.cleanup)
+        self.runs = Path(self._tmp.name) / "runs"
+        self.client = TestClient(_app(Path(self._tmp.name), embedder=StubEmbedder()))
+
+    def test_an_export_taken_mid_session_uses_the_new_name(self):
+        """导出读的是 session.json 里的说话人表，而它平时只在 finalize 时才写。"""
+        with self.client.websocket_connect("/ws/realtime") as ws:
+            ws.send_json({"type": "start"})
+            session_id = ws.receive_json()["session_id"]
+            ws.send_bytes(_pcm_bytes(9.0))
+            self._drain(ws, want="committed")
+            ws.send_json({"type": "rename_speaker", "speaker_id": "S01", "name": "张总"})
+            self._drain(ws, want="speaker",
+                        where=lambda e: any(i["name"] == "张总" for i in e["speakers"]))
+
+            # 会话还在录，这里就导出
+            exported = self.client.get(f"/api/sessions/{session_id}/export?format=txt").text
+
+            ws.send_json({"type": "stop"})
+
+        self.assertIn("张总", exported)
+
+    def _drain(self, ws, *, want, where=None, limit=80):
+        for _ in range(limit):
+            event = ws.receive_json()
+            if event["type"] == want and (where is None or where(event)):
+                return event
+        self.fail(f"没有收到 {want} 事件")
+
+
+class HotwordsReplaceTest(unittest.TestCase):
+    """``set_hotwords`` 是**替换**语义，不是追加。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self._tmp.cleanup)
+        self.runs = Path(self._tmp.name) / "runs"
+        self.client = TestClient(_app(Path(self._tmp.name), embedder=StubEmbedder()))
+
+    def _prompt_after(self, commands):
+        with self.client.websocket_connect("/ws/realtime") as ws:
+            ws.send_json({"type": "start"})
+            session_id = ws.receive_json()["session_id"]
+            for command in commands:
+                ws.send_json(command)
+            ws.send_bytes(_pcm_bytes(9.0))
+            self._drain(ws, want="committed")
+            ws.send_json({"type": "stop"})
+        return self.client.app.state.created_transcribers[-1].prompts[-1]
+
+    def test_the_second_set_replaces_the_first(self):
+        prompt = self._prompt_after([
+            {"type": "set_hotwords", "hotwords": ["阿里云"]},
+            {"type": "set_hotwords", "hotwords": ["降噪"]},
+        ])
+
+        self.assertIn("降噪", prompt)
+        self.assertNotIn("阿里云", prompt)
+
+    def test_empty_hotwords_clear_the_previous_ones(self):
+        prompt = self._prompt_after([
+            {"type": "set_hotwords", "hotwords": ["阿里云"]},
+            {"type": "set_hotwords", "hotwords": []},
+        ])
+
+        self.assertNotIn("阿里云", prompt)
+
+    def test_set_prompt_keeps_the_hotwords_it_was_given_with(self):
+        prompt = self._prompt_after([
+            {"type": "set_prompt", "prompt": "只转写中文", "hotwords": ["阿里云"]},
+        ])
+
+        self.assertIn("只转写中文", prompt)
+        self.assertIn("阿里云", prompt)
+
+    def _drain(self, ws, *, want, where=None, limit=80):
+        for _ in range(limit):
+            event = ws.receive_json()
+            if event["type"] == want and (where is None or where(event)):
+                return event
+        self.fail(f"没有收到 {want} 事件")
+
+
+class NonFiniteFrameTest(unittest.TestCase):
+    """把 int16 采样当 float32 解，长度刚好是 4 的倍数，但内容是 NaN。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self._tmp.cleanup)
+        self.runs = Path(self._tmp.name) / "runs"
+        self.client = TestClient(_app(Path(self._tmp.name), embedder=StubEmbedder()))
+
+    def test_a_frame_full_of_nan_is_rejected_and_the_connection_survives(self):
+        int16 = np.arange(-1600, 1600, dtype=np.int16)
+        misread = np.frombuffer(int16.tobytes(), dtype="<f4")
+        self.assertEqual(int16.nbytes % 4, 0)
+        self.assertFalse(np.isfinite(misread).all())
+
+        with self.client.websocket_connect("/ws/realtime") as ws:
+            ws.send_json({"type": "start"})
+            session_id = ws.receive_json()["session_id"]
+
+            ws.send_bytes(misread.tobytes())
+            error = self._drain(ws, want="error")
+            self.assertEqual(error["code"], "invalid_audio_frame")
+
+            ws.send_bytes(_pcm_bytes(9.0))          # 连接仍然可用
+            self.assertTrue(self._drain(ws, want="committed")["segments"])
+            ws.send_json({"type": "stop"})
+
+    def _drain(self, ws, *, want, where=None, limit=80):
+        for _ in range(limit):
+            event = ws.receive_json()
+            if event["type"] == want and (where is None or where(event)):
+                return event
+        self.fail(f"没有收到 {want} 事件")
+
+
+class RetranscribeWhileRecordingTest(unittest.TestCase):
+    """录音还在写的时候重跑，读到的是一份 WAV 头与内容对不上的半成品。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self._tmp.cleanup)
+        self.runs = Path(self._tmp.name) / "runs"
+
+    def test_a_session_that_is_still_recording_is_409(self):
+        store = SessionStore(self.runs, "live", name="进行中")
+        store.append_audio(np.zeros(16000, dtype=np.float32))
+
+        client = TestClient(_app(Path(self._tmp.name), retranscribe=lambda p, q: "不该被调用"))
+        response = client.post("/api/sessions/live/retranscribe")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["code"], "session_busy")
+
+    def test_a_finished_session_still_re_runs(self):
+        store = SessionStore(self.runs, "done", name="已结束")
+        store.append_audio(np.zeros(16000, dtype=np.float32))
+        store.finalize([])
+
+        client = TestClient(_app(Path(self._tmp.name), retranscribe=lambda p, q: "重跑结果"))
+        response = client.post("/api/sessions/done/retranscribe")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["text"], "重跑结果")
+
+
+def _pcm_bytes(seconds: float) -> bytes:
+    t = np.arange(int(seconds * 16000), dtype=np.float32) / 16000
+    return (0.3 * np.sin(2 * np.pi * 220 * t)).astype("<f4").tobytes()
 
 
 if __name__ == "__main__":

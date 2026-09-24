@@ -153,5 +153,7 @@
   "errors.invalid_format": "Unsupported export format.",
   "realtime.runtime.checking": "Checking",
   "realtime.runtime.available": "Service ready",
-  "realtime.runtime.unavailable": "Service API unreachable"
+  "realtime.runtime.unavailable": "Service API unreachable",
+  "realtime.speaker.applyToAll": "Apply to every segment from this speaker",
+  "errors.session_busy": "This session is still recording — stop it before re-running."
 }

@@ -279,5 +279,61 @@ class TranscribeBytesTest(unittest.TestCase):
         self.assertEqual(result["text"], "plain words")
 
 
+class CheckEndpointUrlTest(unittest.TestCase):
+    """探测与转写请求必须拼同一个根，否则会互相矛盾：请求能过、横幅说不可达。"""
+
+    def _probe_url(self, base_url):
+        import urllib.request
+
+        from moss_transcribe_diarize.app.openai_audio_client import check_endpoint, transcriptions_url
+
+        seen = []
+        original = urllib.request.urlopen
+
+        class _Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            seen.append(request.full_url)
+            return _Response()
+
+        urllib.request.urlopen = fake_urlopen
+        try:
+            check_endpoint(base_url)
+        finally:
+            urllib.request.urlopen = original
+        return seen[0], transcriptions_url(base_url)
+
+    def test_a_bare_host_probes_the_v1_models_route(self):
+        probed, transcribed = self._probe_url("http://127.0.0.1:8000")
+
+        self.assertEqual(probed, "http://127.0.0.1:8000/v1/models")
+        self.assertEqual(transcribed, "http://127.0.0.1:8000/v1/audio/transcriptions")
+
+    def test_an_explicit_v1_is_not_doubled(self):
+        probed, transcribed = self._probe_url("http://host:8000/v1")
+
+        self.assertEqual(probed, "http://host:8000/v1/models")
+        self.assertEqual(transcribed, "http://host:8000/v1/audio/transcriptions")
+
+    def test_a_custom_path_prefix_is_kept(self):
+        probed, transcribed = self._probe_url("http://host/openai")
+
+        self.assertEqual(probed, "http://host/openai/v1/models")
+        self.assertEqual(transcribed, "http://host/openai/v1/audio/transcriptions")
+
+    def test_a_full_transcriptions_url_degrades_to_the_same_root(self):
+        probed, transcribed = self._probe_url("http://host:8000/v1/audio/transcriptions")
+
+        self.assertEqual(probed, "http://host:8000/v1/models")
+        self.assertEqual(transcribed, "http://host:8000/v1/audio/transcriptions")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+
+from moss_transcribe_diarize.prompts import DEFAULT_PROMPT
 
 try:  # pragma: no cover - 只是为了给路由的形参注解一个可解析的名字
     # FastAPI 用 ``get_type_hints`` 解析处理函数的注解，而它只看**模块全局**——所以
@@ -233,6 +236,11 @@ def create_realtime_app(
         path = SessionStore.session_dir(runs, session_id) / "audio.wav"
         if not path.exists():
             return error("audio_missing", "this session has no recording", 404)
+        if meta.get("status") != "done":
+            # 会话还在录：audio.wav 是边写边追加的，读到的是一份 WAV 头声称的长度与实际
+            # 内容对不上的半成品。要么被后端 400 掉，要么真的转出半场内容而用户以为那是
+            # 整场会议——两种都不该发生。
+            return error("session_busy", "this session is still recording; stop it first", 409)
         try:
             text = retranscribe(path, str(meta.get("prompt") or ""))
         except Exception as exc:                                  # noqa: BLE001
@@ -246,10 +254,21 @@ def create_realtime_app(
         await websocket.accept()
         session: RealtimeSession | None = None
         session_id: str | None = None
+        store: SessionStore | None = None
         pump: asyncio.Task | None = None
         pending: list[np.ndarray] = []
         stopping = asyncio.Event()
         pending_limit = int(MAX_PENDING_SECONDS * config.sample_rate)
+        # 基础 prompt 与热词**分开存**：反复 set_hotwords 时拼在每次的结果上会越叠越长
+        # （"热词提示：A 热词提示：B"），而且空热词永远清不掉旧的。
+        base_prompt = DEFAULT_PROMPT
+        hotwords: Any = None
+        # 会话有三个写者：驱动任务（在工作线程里跑窗口）、收尾、以及这条连接上的控制指令。
+        # `RealtimeSession` 明确要求前两者不得并发（见它的类文档），而控制指令同样会写
+        # `Stitcher` 的水位线、说话人表和 `transcript.jsonl`——`reassign_segment` 的
+        # `rewrite_committed` 是**整体重写**，撞上正在追加的窗口就会把刚定稿的那段永久
+        # 抹掉，且不报任何错。这把锁就是那三个写者的互斥；代价是控制指令最多等一个窗口。
+        session_lock = asyncio.Lock()
 
         async def _send(payload: dict) -> None:
             try:
@@ -260,7 +279,8 @@ def create_realtime_app(
         async def pump_windows() -> None:
             while True:
                 try:
-                    events = await session.run_pending()
+                    async with session_lock:
+                        events = await session.run_pending()
                 except Exception as exc:                        # 兜底：绝不让驱动任务静默死掉
                     await _send({"type": "error", "code": "driver_failed", "detail": str(exc)})
                     return
@@ -274,19 +294,41 @@ def create_realtime_app(
                     continue
 
         async def _start(source: dict) -> None:
-            nonlocal session, session_id, pump
+            nonlocal session, session_id, store, base_prompt, hotwords, pump
             if session is not None:
                 return                                          # 重复的 start：忽略，不另开会话
-            prompt = _with_hotwords(str(source.get("prompt") or ""), source.get("hotwords")) or None
-            store = SessionStore(runs, name=str(source.get("session_name") or ""),
-                                 record_audio=record_audio)
-            session = RealtimeSession(
-                config,
-                transcriber=transcriber_factory(),
-                store=store,
-                embedder=embedder,
-                **({"prompt": prompt} if prompt else {}),
-            )
+            if source.get("prompt"):
+                base_prompt = str(source["prompt"])
+            hotwords = source.get("hotwords")
+            prompt = _with_hotwords(base_prompt, hotwords) or None
+            try:
+                store = SessionStore(runs, name=str(source.get("session_name") or ""),
+                                     record_audio=record_audio)
+                # 构造转写器可能很久（hf 那条路要加载权重），必须在工作线程里做——否则
+                # 整个事件循环在这段时间里不响应，别的会话和 /api/runtime 全都挂住。
+                transcriber = await asyncio.get_running_loop().run_in_executor(
+                    None, transcriber_factory
+                )
+                session = RealtimeSession(
+                    config,
+                    transcriber=transcriber,
+                    store=store,
+                    embedder=embedder,
+                    **({"prompt": prompt} if prompt else {}),
+                )
+            except Exception as exc:                            # noqa: BLE001
+                # 后端起不来（模型路径写错、显存不够）必须是**可观测的失败**：发一条
+                # error，并把刚建出来的空会话目录收掉——否则历史里会多出一条永远停在
+                # "recording"、既没有录音也没有转写的幽灵会话。
+                if store is not None:
+                    shutil.rmtree(store.dir, ignore_errors=True)
+                    store = None
+                await _send({
+                    "type": "error",
+                    "code": "backend_unavailable",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                })
+                return
             session_id = store.session_id
             # 把 prompt 落到 session.json：spec §4.6 要求它在那里，而且"重跑本次会话"
             # 要用同一个 prompt——不然重跑出来的内容与实时那次不是一回事。
@@ -316,7 +358,7 @@ def create_realtime_app(
             紧接着就在另一个线程里做同样的事——这正是 ``RealtimeSession`` 文档里那条
             "两者不得并发"的契约。信号 + await 让当前窗口跑完再退出，收尾因此是串行的。
             """
-            nonlocal session, pump
+            nonlocal session, store, pump
             if session is None:
                 return
             if pump is not None:
@@ -328,7 +370,10 @@ def create_realtime_app(
                 pump = None
             current, current_id = session, session_id
             session = None
-            for event in await current.close():
+            async with session_lock:                            # 驱动已退出，这里不会等
+                events = await current.close()
+            store = None
+            for event in events:
                 await _send(event)
             if current_id is not None:
                 registry.drop(current_id)
@@ -347,6 +392,17 @@ def create_realtime_app(
                         })
                         continue
                     frame = np.frombuffer(data, dtype="<f4")
+                    # 长度对得上不代表内容是 PCM：把 int16 采样重新解释成 float32 会得到
+                    # 一批 NaN/次正规数，长度刚好是 4 的倍数。不拦的话它有两种都不会报错的
+                    # 死法：静音门控把整窗判成静音（一帧都不推理，也没有 error），或者被
+                    # 编码成满幅噪声送进模型（幻觉文本）。NaN 绝不是合法 PCM。
+                    if not np.isfinite(frame).all():
+                        await _send({
+                            "type": "error",
+                            "code": "invalid_audio_frame",
+                            "detail": "frame contained non-finite samples; expected float32 little-endian PCM",
+                        })
+                        continue
                     if session is None:
                         pending.append(frame)                   # start 之前先攒着，不丢
                         _trim_pending(pending, pending_limit)
@@ -373,35 +429,50 @@ def create_realtime_app(
                     if session is None:
                         await _send({"type": "error", "code": "no_session", "detail": kind})
                         continue
-                    try:
-                        session.rename_speaker(
-                            str(command.get("speaker_id")), str(command.get("name") or "")
-                        )
-                    except KeyError:
-                        await _send({"type": "error", "code": "unknown_speaker",
-                                     "detail": str(command.get("speaker_id"))})
-                        continue
-                    await _send({"type": "speaker", "speakers": session.speakers()})
+                    async with session_lock:
+                        try:
+                            session.rename_speaker(
+                                str(command.get("speaker_id")), str(command.get("name") or "")
+                            )
+                        except KeyError:
+                            await _send({"type": "error", "code": "unknown_speaker",
+                                         "detail": str(command.get("speaker_id"))})
+                            continue
+                        roster = session.speakers()
+                    # 立刻落盘：导出与历史详情读的是 session.json 里的说话人表，而它平时
+                    # 只在 finalize 时写。不写的话，会开一半改名再导出，文件里还是旧名字
+                    # ——屏幕上叫"张总"、下载下来叫"S01"。
+                    if store is not None:
+                        store.write_meta(speakers=roster)
+                    await _send({"type": "speaker", "speakers": roster})
                 elif kind in ("set_prompt", "set_hotwords"):
                     if session is None:
                         await _send({"type": "error", "code": "no_session", "detail": kind})
                         continue
-                    base = str(command.get("prompt") or session.prompt)
-                    session.set_prompt(_with_hotwords(base, command.get("hotwords")))
+                    # 两条指令是**各自独立**的旋钮：set_hotwords 不该把上一次的拼接结果当成
+                    # 新的基础 prompt 再拼一遍。所以这里存的是"基础 prompt"与"热词"两份。
+                    if command.get("prompt"):
+                        base_prompt = str(command["prompt"])
+                    if "hotwords" in command:
+                        hotwords = command["hotwords"]
+                    async with session_lock:
+                        session.set_prompt(_with_hotwords(base_prompt, hotwords))
                 elif kind == "reassign_segment":
                     if session is None:
                         await _send({"type": "error", "code": "no_session", "detail": kind})
                         continue
-                    updated = session.reassign_speaker(
-                        str(command.get("segment_id")), str(command.get("speaker_id"))
-                    )
+                    async with session_lock:
+                        updated = session.reassign_speaker(
+                            str(command.get("segment_id")), str(command.get("speaker_id"))
+                        )
+                        roster = session.speakers() if updated is not None else None
                     if updated is None:
                         await _send({"type": "error", "code": "unknown_segment",
                                      "detail": str(command.get("segment_id"))})
                         continue
                     # 客户端对 committed 是"增量追加"语义；同一个 id 再来一次即原地替换
                     await _send({"type": "committed", "segments": [updated.to_dict()]})
-                    await _send({"type": "speaker", "speakers": session.speakers()})
+                    await _send({"type": "speaker", "speakers": roster})
                 else:
                     await _send({"type": "error", "code": "unknown_command", "detail": kind})
         except WebSocketDisconnect:

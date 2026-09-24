@@ -153,5 +153,7 @@
   "errors.invalid_format": "不支持的导出格式。",
   "realtime.runtime.checking": "检测中",
   "realtime.runtime.available": "服务正常",
-  "realtime.runtime.unavailable": "连不上服务 API"
+  "realtime.runtime.unavailable": "连不上服务 API",
+  "realtime.speaker.applyToAll": "应用到同一说话人的全部段",
+  "errors.session_busy": "会话还在录音中，先停止再重跑。"
 }
