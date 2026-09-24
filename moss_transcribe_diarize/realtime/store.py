@@ -90,7 +90,8 @@ class SessionStore:
         再写一遍（换上新 id 的重复行）——那不叫恢复，只是把丢失换成了重复。
 
         做法：先在内存里把整批序列化好（后面某条坏了就一条都还没写），再一次写入；写入
-        本身抛异常时把文件截回追加前的长度。
+        本身抛异常时**尽力**把文件截回追加前的长度。截断是尽力而为，不是保证——见下面
+        except 里的说明。
         """
         payload = "".join(
             json.dumps(item.to_dict(), ensure_ascii=False) + "\n" for item in segments
@@ -103,7 +104,10 @@ class SessionStore:
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(payload)
         except Exception:
-            # 尽力截回追加前的长度。这里不吞异常：真正的失败原因要原样抛给调用方。
+            # 截断是尽力而为，且它自己失败时抛出去的是截断的 OSError——原始的写入失败
+            # 原因会被盖住。这时盘上可能留下**完整的一行**（写入恰好停在行边界上），而
+            # 调用方会把水位线回滚、下一窗重新定稿同一段内容，于是那一行变成重复行。
+            # 故意不吞这个异常：吞掉就会多出一个无法测试、且会把清理失败藏起来的分支。
             with path.open("r+b") as handle:
                 handle.truncate(size_before)
             raise

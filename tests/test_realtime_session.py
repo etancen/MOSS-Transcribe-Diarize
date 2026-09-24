@@ -768,70 +768,130 @@ class SilenceGateTest(unittest.TestCase):
         self.assertEqual(status["gated_windows"], 1)
         self.assertAlmostEqual(status["gated_sec"], 10.0, places=2)
 
-    def _drive_gated(self, total_seconds: float, **kwargs) -> list[tuple[float, float]]:
-        """按 poll_interval 的节奏推流、每次推流后轮询，返回已执行的窗口区间。
+    def _drive_gated(
+        self, total_seconds: float, *, block: float | None = None, late_after: int | None = None, **kwargs
+    ) -> tuple[list[tuple[float, float]], float]:
+        """按 poll_interval 轮询、按 block 的粒度推流，返回已执行窗口区间与总时长。
 
-        节奏必须与生产一致：决策点落在以首次决策为锚的 hop 网格上，而网格的位置取决于
-        推流节奏。按 5 秒一块推会让网格恰好落在 window 的整数倍上，把门控留下的空隙掩盖
-        掉——旧版本正是这样"通过"的。
+        **两个节奏必须解耦**：决策点落在以执行结果为锚的网格上，而网格步长由
+        ``total_seconds`` 每次跳多少决定，不是由 hop 决定。按 poll_interval 推流会让两者
+        重合（步长恰好是 hop 的整数倍），把"网格被拉长"造成的空隙掩盖掉——那是上一版
+        测试看不出来的原因。block 默认等于 poll_interval；late_after=k 表示第 k 次推流后
+        不轮询（一次迟到的轮询），于是下一次轮询晚了一个间隔。
+
+        末尾会调用 close()：收尾窗口的终点恰好是 total，于是"覆盖到会话末尾"变成一条可以
+        直接断言的性质（见 _assert_covers_the_whole_session）。
         """
         config = _config(silence_gate=True, **kwargs)
+        step = config.poll_interval
+        block = step if block is None else block
         session = SpanRecordingSession(
             config,
             transcriber=ScriptedTranscriber([]),
             store=SessionStore(self.runs, "s1"),
         )
         pushed = 0.0
+        pushes = 0
         while pushed < total_seconds - 1e-9:
-            session.push_audio(_silence(config.poll_interval))
-            pushed += config.poll_interval
-            self._run(session.run_pending())
-        return session.spans
+            session.push_audio(_silence(block))
+            pushed += block
+            pushes += 1
+            if late_after is not None and pushes == late_after:
+                continue
+            # 一个 block 的时长里该轮到几次轮询就轮询几次（没有新音频时的轮询是空操作，
+            # 但保持与生产的 poll_interval 节奏一致）。
+            for _ in range(max(1, int(round(block / step)))):
+                self._run(session.run_pending())
+        self._run(session.close())
+        return session.spans, pushed
 
-    def _assert_no_unreachable_audio(self, spans: list[tuple[float, float]]) -> None:
-        """断言从 0 起、到最后一次执行窗口的末尾为止，没有一段音频落在所有窗口之外。
+    def _assert_covers_the_whole_session(
+        self, spans: list[tuple[float, float]], total: float
+    ) -> None:
+        """断言已执行窗口的并集**覆盖 [0, total] 且没有空隙**，一次报出全部空隙。
 
-        ``reached`` 从 0.0 起算，所以"首个窗口没有覆盖到会话开头"也算一个空隙；报告**全部**
-        空隙而不只报第一个，是为了让 `window % hop != 0` 那种"每次执行之后都留一个空隙"的
-        失败形态一次看清。
+        空隙是不可恢复的：后续窗口的左边界只会更晚，永远够不到它。报告全部而不是只报
+        第一个，是为了让"每次执行之后都留一条缝"的失败形态一次看清。
 
-        刻意**不**要求覆盖到最后一次执行之后的音频——那是设计内的待办：下一次调度最多再等
-        一个 hop，而它的左边界会被判据拉回到上一次的右边界之前。空隙才是不可恢复的那个，
-        因为后续窗口的左边界只会更晚，永远够不到它。
+        前提是音频还在环形缓冲里。前端已经被淘汰时（驱动停摆期间音频仍在到达）任何窗口
+        都读不到那一段——那不是这个断言能覆盖的情形，由
+        ``test_a_front_that_fell_out_of_the_buffer_does_not_stall_the_session`` 单独钉住
+        "会话还能继续跑"。
         """
-        self.assertTrue(spans, "门控把每一次推理都跳过了")
+        self.assertTrue(spans, "一次推理都没跑")
         holes: list[tuple[float, float]] = []
         reached = 0.0
         for start, end in spans:
             if start > reached + 1e-9:
                 holes.append((round(reached, 3), round(start, 3)))
             reached = max(reached, end)
+        if reached < total - 1e-9:
+            holes.append((round(reached, 3), round(total, 3)))
         self.assertEqual(holes, [], f"这些区间没有任何窗口覆盖: {holes}")
         # 覆盖性是主断言，这条只防"门控退化成几乎不跑"。放在最后：否则它会先失败，把
         # 真正想报的空隙盖住。
         self.assertGreaterEqual(len(spans), 3, "门控把绝大部分推理都跳过了")
 
     def test_gate_preserves_reachability_at_the_poll_cadence(self):
-        """持续静音时门控只能**推迟**推理，不能让音频变得不可达。
+        """按文档节奏（0.5 秒一块、0.5 秒一轮询）驱动时，覆盖是完整的。
 
-        实测（0.5 秒一拍、window=20 / hop=5）：已执行窗口 [0,18]、[18,38]、[38,58]，
-        并集从 0 起连续。判据若退回 `end - last_executed < window`，同一节奏下实测得到
-        [3,23]、[23,43]——[0,3) 永远不会被任何窗口覆盖。
+        实测：已执行窗口 [0,18]、[18,38]、[38,58]，收尾窗口 [40,60]——并集覆盖 [0,60]。
         """
-        spans = self._drive_gated(60.0)
+        spans, total = self._drive_gated(60.0)
 
-        self._assert_no_unreachable_audio(spans)
+        self._assert_covers_the_whole_session(spans, total)
 
     def test_gate_preserves_reachability_when_hop_does_not_divide_the_window(self):
-        """window=20 / hop=7：window % hop != 0，空隙会出现在**每一次**执行之后。
+        """window=20 / hop=7：window % hop != 0 时网格步长更难对齐。
 
-        实测（0.5 秒一拍）：已执行窗口 [0,15]、[9,29]、[23,43]、[37,57]，相邻两两相接或
-        重叠，并集从 0 起连续。退回 `< window` 的判据时实测得到 [2,22]、[23,43]，空隙
-        (22,23)。
+        实测：已执行窗口 [0,15]、[9,29]、[23,43]、[37,57]，收尾窗口 [40,60]；相邻两两
+        相接或重叠，并集覆盖 [0,60]。
         """
-        spans = self._drive_gated(60.0, hop=7.0)
+        spans, total = self._drive_gated(60.0, hop=7.0)
 
-        self._assert_no_unreachable_audio(spans)
+        self._assert_covers_the_whole_session(spans, total)
+
+    def test_reachability_when_audio_arrives_in_larger_blocks(self):
+        """音频按 1.5 秒一块到达（WebSocket 传输的常态）时，覆盖仍然完整。
+
+        到达粒度会把决策网格的步长拉到 hop 以上（1.5 秒一块、hop=5 时步长是 6 秒），
+        于是决策自己算出的左边界会落到上一次执行窗口的右边之后。**修复前实测空隙
+        (0.0, 1.0)**：首个执行窗口是 [1.0, 21.0]，而后面每个窗口的左边界都更晚，
+        开头那一秒永远没被读到。修复后首个窗口是 [0.0, 21.0]。
+        """
+        spans, total = self._drive_gated(60.0, block=1.5)
+
+        self._assert_covers_the_whole_session(spans, total)
+
+    def test_reachability_when_a_poll_arrives_late(self):
+        """一次迟到的轮询（隔了两个间隔）不得留下永久空隙。
+
+        **修复前实测空隙 (18.0, 18.5)**：首窗在 total=18.0 执行；第 76 次推流后那次轮询
+        迟到，于是一直跳过的主循环把下一次执行推到 total=38.5，其左边界 18.5 落在上一次
+        的右边界 18.0 之后。修复后该窗起点被钳回 18.0（实测 [18.0, 38.5]）。
+        """
+        spans, total = self._drive_gated(60.0, late_after=76)
+
+        self._assert_covers_the_whole_session(spans, total)
+
+    def test_a_front_that_fell_out_of_the_buffer_does_not_stall_the_session(self):
+        """前端被淘汰时仍要能跑起来，不能永远卡在"请求已淘汰的音频"上。
+
+        起点钳位让窗口往回收，收得太远（驱动停摆期间音频仍在到达，把保留头推到前端之后）
+        时 slice 会返回 None；此时必须退回决策自己的窗口，否则每次轮询都会再问一次同一段
+        已淘汰的音频，会话永远不再推理（实测退化形态：一次推理都不再发生）。
+
+        容量 30 秒、40 秒一次性到达两次：第一次决策的 [0,40] 已经读不到（保留头在 10）。
+        这里钉的是**会话还能继续**——total=80 时那次决策仍要真的执行，随后收尾窗口也要
+        执行，两次都覆盖到末尾（实测 [(60.0, 80.0), (60.0, 80.0)]）。
+
+        注意这条钉的是"还能跑"，不是"覆盖完整"：被淘汰的那段音频任何窗口都读不到，而
+        回退到决策自己的窗口会让 (保留头, window 左边界) 这段**仍可读**的音频留在原地
+        ——这是驱动停摆超过缓冲容量这种病态情形下的既有行为，不是这个修复引入的。
+        """
+        spans, total = self._drive_gated(80.0, block=40.0, buffer_capacity=30.0)
+
+        self.assertEqual(spans, [(60.0, 80.0), (60.0, 80.0)])
 
 
 if __name__ == "__main__":

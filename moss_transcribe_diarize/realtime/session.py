@@ -109,9 +109,10 @@ class RealtimeSession:
             sample_rate=config.sample_rate,
         )
         self._last_run_sec: float | None = None
-        # 上一次**真正跑过**的窗口的末尾（含失败的那次）。与 _last_run_sec 的区别：
-        # 后者是节流用的调度锚点，被静音门控跳过的窗口也会推进它；这个只在窗口真的
-        # 跑过时推进，静音门控靠它兜住"音频不能被跳过到不可达"的下限。
+        # 已覆盖前端：上一次**真正执行过**的窗口的末尾（含失败的那次）。与 _last_run_sec
+        # 的区别是它只在窗口真的跑过时推进——被静音门控跳过的窗口不动它。
+        # 两个用途：下一个执行窗口的起点被钳到它之前（保证覆盖连续——前端被淘汰时的例外
+        # 见 run_pending 的回退分支），以及门控用它判断"距上次执行多久了"。
         self._last_executed_end = 0.0
         self._gated_windows = 0
         self._gated_sec = 0.0
@@ -147,7 +148,24 @@ class RealtimeSession:
         decision = self._policy.decide(total_seconds=total, last_run_sec=self._last_run_sec)
         if not decision.should_run:
             return []
-        audio = self._buffer.slice(decision.start_sec, decision.end_sec)
+        # 起点钳到"已覆盖前端"：窗口调度落在以执行结果为锚的网格上，而**网格步长并不等于
+        # hop**——决策要等 poll_interval，音频又按到达块推进 total_seconds，两者都会把步长
+        # 拉长，且会话事先无从知道拉长多少。于是决策自己算出的左边界可能落在上一次执行窗口
+        # 的右边界之后，那段夹缝永远没有任何窗口覆盖得到。取两者**更早**的一个即可：只要前端
+        # 仍在缓冲里，每一次执行的窗口都与上一次相接或重叠，覆盖从第一窗（起点恒为 0）起
+        # 连续——与网格步长、轮询节奏、音频到达粒度都无关。前端被淘汰时见下面的回退分支。
+        # 代价：这样被迫放行的窗口可以长于 window（多出不到一个步长）。
+        start = min(decision.start_sec, self._last_executed_end)
+        audio = self._buffer.slice(start, decision.end_sec)
+        if audio is None:
+            # 前端已经滑出环形缓冲（例如驱动停摆期间音频仍在到达，把它挤掉了）。退回决策
+            # 自己的窗口：那一段任何窗口都读不到（不是这个钳位能救回来的），但会话必须还能
+            # 继续跑——否则每次轮询都会再问一次同一段已淘汰的音频，永远跑不起来。
+            # 这不是覆盖的兜底：回退之后，(保留头, 决策左边界) 之间**仍可读**的那段音频不会
+            # 被任何窗口读到。这一条只在"停摆时长超过缓冲容量"这种病态情形下出现，代价与
+            # 修复前相同（修复前也从决策左边界开始），由测试单独钉住"会话还能继续跑"。
+            start = decision.start_sec
+            audio = self._buffer.slice(start, decision.end_sec)
         if audio is None or audio.size == 0:
             # 没有可推理的音频。推进 last_run_sec，避免每次轮询都重试。
             self._last_run_sec = decision.end_sec
@@ -158,15 +176,14 @@ class RealtimeSession:
             self.config.silence_rms_db,
             self.config.silence_frame_ratio,
         ):
-            # 门控只允许**推迟**一个窗口，绝不能让音频变得不可达。判据要按"下一个已
-            # 执行窗口的左边界能否勾回上一次的右边界"来定，而不是按"跳过了多久"：决策
-            # 落在以首次决策为锚的 hop 网格上，满 hop 才轮到下一次，所以下一次执行必然
-            # 满足 end - last_executed >= window - hop，那时它的左边界 end - window 不晚
-            # 于 last_executed，两个窗口相接或重叠。
-            # 若要求攒满整个 window 才放行，每次执行都会在上一个窗口的右边界之后留下
-            # 最多 hop 秒的空隙（window % hop != 0 时每次都会留），那段音频永远落在所有
-            # 后续窗口的左边界之外——不可恢复。代价：持续静音时约每 window - hop 秒放行
-            # 一次推理，而不是一次都不跑。
+            # 门控只决定**多久放行一次**；覆盖由上面的起点钳位保证，不靠这个判据（先前
+            # 版本试图用它保证覆盖，那是错的：网格步长不可预知）。
+            # 判据是"距上次执行已攒够 window - hop 秒"，所以相邻两次执行的实际间隔
+            # **不小于** window - hop——它是**下界**而不是近似值。实测：默认配置 20 秒、
+            # hop=7 时 14 秒。
+            # 上界不是 window：网格步长可以大于 hop（音频按块到达、轮询自身也有间隔，会话
+            # 事先无从知道步长），所以间隔最多是 window - hop 再加一个网格步长。实测：12 秒
+            # 一块、window=20 / hop=5 时间隔 24 秒（超过 window），放行的窗口因此被拉长。
             if (
                 decision.end_sec - self._last_executed_end
                 <= self.config.window - self.config.hop
@@ -177,7 +194,7 @@ class RealtimeSession:
                 self._gated_windows += 1
                 self._gated_sec += decision.end_sec - decision.start_sec
                 return [self._status_event()]
-        return await self._run_window(decision.start_sec, decision.end_sec, audio)
+        return await self._run_window(start, decision.end_sec, audio)
 
     async def close(self) -> list[dict]:
         if self._closed:
@@ -187,8 +204,16 @@ class RealtimeSession:
         window_audio: np.ndarray | None = None
         window_start = 0.0
         if total > 0:
-            window_start = max(0.0, total - self.config.window)
+            # 与 run_pending 同样的起点钳位：收尾窗口也要勾回已覆盖前端，否则会话末尾
+            # 那段（前端到 window 左边之间）的音频没有任何窗口读到过。
+            window_start = min(
+                max(0.0, total - self.config.window), self._last_executed_end
+            )
             window_audio = self._buffer.slice(window_start, total)
+            if window_audio is None:
+                # 同 run_pending：前端已被淘汰时退回决策自己的窗口，别让收尾整窗落空。
+                window_start = max(0.0, total - self.config.window)
+                window_audio = self._buffer.slice(window_start, total)
             if window_audio is not None and window_audio.size:
                 # 用正常的 tail 再跑一次，让临时区拿到最新推理结果，再整段定稿。
                 events.extend(await self._run_window(window_start, total, window_audio))
