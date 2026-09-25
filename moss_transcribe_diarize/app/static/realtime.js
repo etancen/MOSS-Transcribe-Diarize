@@ -1,13 +1,3 @@
-/**
- * 实时会议转写的前端。
- *
- * 没有框架、没有构建步骤：这个服务是"跑在本地、临时开个会用"的东西，为一个页面配一套
- * 打包器不划算。
- *
- * 两栏：左边是**定稿区**（`committed` 是增量追加语义，同一个 id 再来一次即原地替换），
- * 右边是**临时区**（`provisional` 是整体替换语义）。协议见 spec §4.9。
- */
-
 import {
   applyDocumentTranslations,
   getLocale,
@@ -16,91 +6,24 @@ import {
   setLocale,
   t,
 } from "./i18n.js";
+import {
+  applyRename,
+  formatClock,
+  mergeCommitted,
+  pipelineHint,
+  segmentsForSpeaker,
+  shouldFollow,
+  speakerColor,
+  speakerIndex,
+} from "./realtime_logic.js";
 
 const WS_PATH = "/ws/realtime";
 const FRAME_SAMPLES = 1600;          // 100 ms @ 16 kHz
 const TARGET_RATE = 16000;
 const BACKPRESSURE_BYTES = 2 * 1024 * 1024;
-const FOLLOW_THRESHOLD_PX = 24;
-const SPEAKER_COLORS = [
-  "#007d77", "#c94b35", "#2f7d4f", "#7b5ea7", "#a8721a", "#1f6fb2", "#a3336b", "#5a6b3b",
-];
 
-// ---------------------------------------------------------------- 纯函数
-// 能被纯函数表达的判定都放在这里：浏览器侧没法用 pytest 覆盖，这些至少能在控制台里
-// 逐条调、也能被走查脚本断言。
-
-/** `mm:ss`，超过一小时才带上小时。 */
-export function formatClock(seconds) {
-  const total = Math.max(0, Math.floor(Number(seconds) || 0));
-  const pad = (value) => String(value).padStart(2, "0");
-  const hours = Math.floor(total / 3600);
-  const minutes = Math.floor((total % 3600) / 60);
-  const secs = total % 60;
-  return hours > 0 ? `${hours}:${pad(minutes)}:${pad(secs)}` : `${pad(minutes)}:${pad(secs)}`;
-}
-
-/** 说话人 id 的数字部分决定颜色，所以同一个 S02 在两次会话里颜色一致。 */
-export function speakerIndex(speakerId) {
-  const text = String(speakerId || "");
-  const match = /^[A-Za-z]*(\d+)$/.exec(text);
-  if (match) return Number(match[1]) - 1;
-  let hash = 0;
-  for (const ch of text) hash = (hash * 31 + ch.codePointAt(0)) % 997;
-  return hash;
-}
-
-export function speakerColor(speakerId) {
-  const index = Math.abs(Math.trunc(speakerIndex(speakerId))) % SPEAKER_COLORS.length;
-  return SPEAKER_COLORS[index];
-}
-
-/**
- * `committed` 是**增量追加**语义，但改归属时同一个 id 会再来一次——那次要原地替换。
- */
-export function mergeCommitted(segments, incoming) {
-  const list = segments.slice();
-  for (const segment of incoming || []) {
-    const at = list.findIndex((item) => item.id === segment.id);
-    if (at >= 0) list[at] = segment;
-    else list.push(segment);
-  }
-  return list;
-}
-
-/**
- * 改名之后**已经显示过的段落也要跟着变**——否则用户改了名字却只看到新段落换了名。
- * `rename_speaker` 只改说话人表；协议里没有一个"重发历史段"的事件。
- */
-export function applyRename(segments, speakerId, name) {
-  return (segments || []).map((segment) => (
-    segment.speaker === speakerId
-      ? { ...segment, speaker_name: name }
-      : segment
-  ));
-}
-
-/**
- * 滚动位置用"距底部多少像素"判断，不用 `scrollTop`：内容在增长时 `scrollTop` 不变而
- * 实际已经不在底部，自动滚动会跟用户抢。
- */
-export function shouldFollow(container, threshold = FOLLOW_THRESHOLD_PX) {
-  if (!container) return true;
-  const distance = container.scrollHeight - container.scrollTop - container.clientHeight;
-  return distance <= threshold;
-}
-
-/**
- * 定稿区里所有属于某个说话人的段落 id。
- *
- * 用于"改一段可批量应用到同组"（spec §4.4 把手工改归属称为必要补偿，§5.2 要求下拉旁
- * 可勾选）。前端的"组"就是**当前归属于这个说话人的全部段**——用户改一次归属的意图是
- * "这个人其实是那位"，而不是"这一段特殊"。
- */
-export function segmentsForSpeaker(segments, speakerId) {
-  return (segments || []).filter((segment) => segment.speaker === speakerId)
-    .map((segment) => segment.id);
-}
+// 能被纯函数表达的判定都住在 realtime_logic.js 里，由 tests/js/ 用 node --test 覆盖；
+// 这个文件只管 DOM 与网络。
 
 // ---------------------------------------------------------------- 应用
 
@@ -120,6 +43,10 @@ const state = {
   startedAt: 0,
   audio: null,
   lastStatus: null,
+  hasStatus: false,
+  failures: 0,
+  degraded: false,
+  stickyNotice: false,
 };
 
 const dom = {};
@@ -138,12 +65,26 @@ function cacheDom() {
   for (const id of ids) dom[id] = document.getElementById(id);
 }
 
-function notice(key, params) {
+/**
+ * `sticky` 的消息不会被计时器收走。
+ *
+ * 默认 8 秒自动消失是为了不挡路，但**故障**不能这样：用户往往正看着别处，回来时告警
+ * 已经没了，屏幕上只剩一片空白——那和"什么都没发生"没有区别。故障留到它自己好为止。
+ */
+function notice(key, params, { sticky = false } = {}) {
   if (!dom.notice) return;
   dom.notice.textContent = t(key, params);
   dom.notice.hidden = false;
   window.clearTimeout(notice.timer);
-  notice.timer = window.setTimeout(() => { dom.notice.hidden = true; }, 8000);
+  state.stickyNotice = sticky;
+  if (!sticky) notice.timer = window.setTimeout(() => { dom.notice.hidden = true; }, 8000);
+}
+
+function clearStickyNotice() {
+  if (!state.stickyNotice) return;
+  state.stickyNotice = false;
+  window.clearTimeout(notice.timer);
+  if (dom.notice) dom.notice.hidden = true;
 }
 
 const STATE_MESSAGES = {
@@ -184,7 +125,24 @@ function renderCommitted() {
   for (const segment of state.committed) {
     container.appendChild(committedRow(segment));
   }
-  if (dom.committedEmpty) dom.committedEmpty.hidden = state.committed.length > 0;
+  if (dom.committedEmpty) {
+    dom.committedEmpty.hidden = state.committed.length > 0;
+    // 空的时候要说清**为什么**空。这片空白有五种完全不同的原因（还没开始、正在攒够
+    // 第一个窗口、窗口跑过但还没稳定内容、输入一直是静音被门控跳过、后端在连续失败），
+    // 而它们过去长得一模一样：两边空白、状态写着"转写中"——用户只能得出"它不工作"。
+    const hint = pipelineHint({
+      sending: state.sending,
+      hasStatus: state.hasStatus,
+      committed: state.committed.length,
+      provisional: state.provisional.length,
+      gatedWindows: state.lastStatus ? state.lastStatus.gated_windows : 0,
+      degraded: state.degraded,
+      failures: state.failures,
+    });
+    dom.committedEmpty.textContent = hint
+      ? t(hint.key, hint.params)
+      : t("realtime.committed.empty");
+  }
   if (keepFollowing) container.scrollTop = container.scrollHeight;
 }
 
@@ -332,10 +290,20 @@ function handleEvent(event) {
       break;
     case "status":
       state.lastStatus = event;
+      state.hasStatus = true;
+      state.degraded = Boolean(event.degraded);
+      if (!state.degraded) state.failures = 0;
+      if (state.degraded) notice("realtime.notice.degraded", {}, { sticky: true });
+      else clearStickyNotice();
       renderStats();
+      renderCommitted();                 // 空态的解释要跟着门控计数一起更新
       break;
     case "error":
-      notice("realtime.notice.error", { detail: `${event.code}: ${event.detail}` });
+      state.failures = Number(event.failures) || state.failures + 1;
+      // 故障不留 8 秒就消失：用户回来时告警已经没了，屏幕上只剩空白。
+      notice("realtime.notice.error", { detail: `${event.code}: ${event.detail}` },
+             { sticky: true });
+      renderCommitted();
       break;
     default:
       break;
@@ -553,7 +521,11 @@ async function start() {
   state.roster = new Map();
   state.droppedFrames = 0;
   state.lastStatus = null;
+  state.hasStatus = false;
+  state.failures = 0;
+  state.degraded = false;
   state.follow = true;
+  clearStickyNotice();
   renderCommitted();
   renderProvisional();
   renderStats();
@@ -761,6 +733,7 @@ async function main() {
   wire();
   await loadRuntime();
   setPhase("idle");
+  renderCommitted();          // 开机就说清"还没有开始"，而不是留一句无信息量的占位
   dom.pauseButton.disabled = true;
   dom.stopButton.disabled = true;
   window.addEventListener("beforeunload", killAudio);
@@ -773,7 +746,7 @@ window.mtdRealtime = {
   },
   reloadRuntime: loadRuntime,
   helpers: { formatClock, speakerColor, speakerIndex, mergeCommitted, applyRename,
-             shouldFollow, segmentsForSpeaker },
+             shouldFollow, segmentsForSpeaker, pipelineHint },
   state: () => ({
     sessionId: state.sessionId,
     committed: state.committed.length,

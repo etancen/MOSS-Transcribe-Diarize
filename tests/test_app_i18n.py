@@ -57,7 +57,10 @@ class LocaleCatalogTest(unittest.TestCase):
         """实时页面用到的每个词条都必须在 en 里存在（zh-CN 由上面那条保证一致）。"""
         english = self.catalogs["en"]
         html = (STATIC_DIR / "realtime.html").read_text(encoding="utf-8")
-        script = (STATIC_DIR / "realtime.js").read_text(encoding="utf-8")
+        script = "".join(
+            (STATIC_DIR / name).read_text(encoding="utf-8")
+            for name in ("realtime.js", "realtime_logic.js")
+        )
         html_keys = set(re.findall(r'data-i18n(?:-[a-z-]+)?="([^"]+)"', html))
         # 引号与边界写成 chr()/字符类，是为了这条正则里不出现任何转义序列。
         quotes = '\'"'

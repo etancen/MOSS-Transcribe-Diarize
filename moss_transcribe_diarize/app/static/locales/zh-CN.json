@@ -155,5 +155,11 @@
   "realtime.runtime.available": "服务正常",
   "realtime.runtime.unavailable": "连不上服务 API",
   "realtime.speaker.applyToAll": "应用到同一说话人的全部段",
-  "errors.session_busy": "会话还在录音中，先停止再重跑。"
+  "errors.session_busy": "会话还在录音中，先停止再重跑。",
+  "realtime.hint.idle": "还没有开始：选好输入（麦克风 / 系统声）后点「开始」。",
+  "realtime.hint.warmingUp": "正在攒够第一个窗口：默认要至少 8 秒音频才会跑第一次推理，这期间屏幕会是空的，属于正常。",
+  "realtime.hint.waiting": "推理已经跑过，正在等第一段稳定内容定稿——默认再等几秒。",
+  "realtime.hint.silentWindows": "已经跳过 {count} 个静音窗口：这几段音频里几乎没有超过静音阈值的声音。检查麦克风有没有选错、有没有被静音，或者系统声那一路没接上。",
+  "realtime.hint.degraded": "转写后端连续失败（{count} 次），正在重试。看下面的红字提示与服务端日志。",
+  "realtime.notice.degraded": "转写后端连续失败，正在重试——这段时间不会有新内容。"
 }

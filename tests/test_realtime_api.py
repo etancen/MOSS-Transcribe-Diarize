@@ -721,6 +721,12 @@ class StaticAssetTest(unittest.TestCase):
     def test_a_missing_asset_is_404(self):
         self.assertEqual(self.client.get("/assets/nope.js").status_code, 404)
 
+    def test_assets_are_not_cached(self):
+        """改了代码却因为浏览器缓存没生效，是一次很难查的玄学——本地服务不该缓存。"""
+        response = self.client.get("/assets/realtime.js")
+
+        self.assertEqual(response.headers.get("cache-control"), "no-store")
+
     def test_a_directory_is_404_not_a_listing(self):
         self.assertEqual(self.client.get("/assets/locales").status_code, 404)
 

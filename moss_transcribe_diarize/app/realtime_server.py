@@ -164,7 +164,9 @@ def create_realtime_app(
         if not target.is_file() or root not in target.parents:
             return JSONResponse({"detail": "asset not found"}, status_code=404)
         media = _MEDIA_TYPES.get(target.suffix.lower(), "application/octet-stream")
-        return FileResponse(target, media_type=media)
+        # 和 `/` 一样不缓存：这是个本地服务，页面与脚本都在快速迭代，缓存只会让"改了代码
+        # 却没生效"变成一次玄学排查；对升级了包的人来说还会一直跑旧 JS。
+        return FileResponse(target, media_type=media, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/runtime")
     def runtime():
