@@ -73,9 +73,22 @@ export function segmentsForSpeaker(segments, speakerId) {
 }
 
 /**
+ * 麦克风在送**数字静音**的判据。
+ *
+ * 系统层禁掉麦克风时，Chrome 常常**不是**报错，而是正常 resolve 一条全程为 0 的轨道；
+ * 设备选错、耳机没插好也会给出同样的东西。这时 getUserMedia 是成功的、界面显示"已开麦"、
+ * 一帧不少地往后端送——送的全是 0。所以判据只能看样本本身：数字静音是**恰好** 0，
+ * 而任何真实麦克风（哪怕很安静的房间）都有自己的底噪，峰值不会掉到 1e-4 以下。
+ *
+ * 攒够 2 秒再下结论：刚点开始的那一瞬间本来就没有声音。
+ */
+export const MIC_SILENCE_PEAK = 1e-4;
+export const MIC_SILENCE_FRAMES = 20;
+
+/**
  * 转写区还是空的时候，**为什么**它空着。
  *
- * 这一条是这张页面最容易骗人的地方：它的空屏有五种完全不同的原因——还没开始、正在攒够
+ * 这一条是这张页面最容易骗人的地方：它的空屏有一串完全不同的原因——还没开始、正在攒够
  * 第一个窗口（默认要 8 秒）、窗口跑过但还没攒出稳定内容、输入的音频一直是静音被门控全部
  * 跳过、后端连续失败。界面上它们长得一模一样：两边空白，状态写着"转写中"。用户因此只能
  * 得出"这东西不工作"。把原因算出来，界面才有话可说。
@@ -91,10 +104,17 @@ export function pipelineHint({
   gatedWindows = 0,
   degraded = false,
   failures = 0,
+  framesSent = 0,
+  peakLevel = 0,
 } = {}) {
   if (committed > 0 || provisional > 0) return null;
   if (!sending) return { key: "realtime.hint.idle", params: {} };
   if (degraded || failures > 0) return { key: "realtime.hint.degraded", params: { count: failures } };
+  // 这一条排在"静音窗口"之前：门控跳过是**结果**，送的是静音才是原因。而且它比第一个窗口
+  // 还早就能下结论——攒够 2 秒就够判断了，不必等 8 秒。
+  if (framesSent >= MIC_SILENCE_FRAMES && peakLevel < MIC_SILENCE_PEAK) {
+    return { key: "realtime.hint.micSilent", params: {} };
+  }
   if (!hasStatus) return { key: "realtime.hint.warmingUp", params: {} };
   if (gatedWindows > 0) return { key: "realtime.hint.silentWindows", params: { count: gatedWindows } };
   return { key: "realtime.hint.waiting", params: {} };

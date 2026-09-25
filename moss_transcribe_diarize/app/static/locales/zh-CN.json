@@ -139,7 +139,7 @@
   "realtime.notice.error": "服务端报错：{detail}",
   "realtime.notice.audioUnsupported": "这个浏览器不支持 AudioContext，无法采集音频。",
   "realtime.notice.resampled": "浏览器不接受 16 kHz 的 AudioContext，已回退到 {rate} Hz 并在 worklet 里重采样。",
-  "realtime.notice.noMic": "拿不到麦克风权限，只能用系统声，或换个浏览器。",
+  "realtime.notice.noMic": "拿不到麦克风：{detail}。可以用系统声那一路，或者换个浏览器。",
   "realtime.notice.shareHint": "共享时请勾选「分享系统音频」，或直接共享会议所在的标签页。",
   "realtime.notice.needSource": "至少要有一路输入（麦克风或系统声）才能开始。",
   "realtime.notice.wsClosed": "与服务的连接断了。",
@@ -161,5 +161,9 @@
   "realtime.hint.waiting": "推理已经跑过，正在等第一段稳定内容定稿——默认再等几秒。",
   "realtime.hint.silentWindows": "已经跳过 {count} 个静音窗口：这几段音频里几乎没有超过静音阈值的声音。检查麦克风有没有选错、有没有被静音，或者系统声那一路没接上。",
   "realtime.hint.degraded": "转写后端连续失败（{count} 次），正在重试。看下面的红字提示与服务端日志。",
-  "realtime.notice.degraded": "转写后端连续失败，正在重试——这段时间不会有新内容。"
+  "realtime.notice.degraded": "转写后端连续失败，正在重试——这段时间不会有新内容。",
+  "realtime.mic.info": "麦克风：{label} · {rate} Hz · 已送 {seconds}s · 电平 {level}%",
+  "realtime.mic.unknown": "未知设备",
+  "realtime.hint.micSilent": "麦克风在往后端送全 0 的静音：设备拿到了，但送出来的每一帧都是 0。系统层的麦克风权限（Windows 设置 → 隐私和安全性 → 麦克风）、选错输入设备、耳机没插好都会是这样。换一个设备或检查权限后重新开始。",
+  "realtime.notice.micSilent": "麦克风送出来的是全 0 的静音——检查系统麦克风权限与输入设备。"
 }

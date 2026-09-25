@@ -107,3 +107,35 @@ test("后端在连续失败时，降级优先于静音猜测", () => {
     "realtime.hint.degraded",
   );
 });
+
+test("送出去的是数字静音时，直说麦克风没在送声音", () => {
+  const hint = pipelineHint({ sending: true, framesSent: 30, peakLevel: 0 });
+
+  assert.equal(hint.key, "realtime.hint.micSilent");
+});
+
+test("麦克风有底噪就不算静音——安静的房间也不该被判成没在送", () => {
+  const hint = pipelineHint({ sending: true, framesSent: 30, peakLevel: 0.001 });
+
+  assert.equal(hint.key, "realtime.hint.warmingUp");
+});
+
+test("攒够 2 秒之前不下结论：刚开始本来就没声音", () => {
+  const hint = pipelineHint({ sending: true, framesSent: 5, peakLevel: 0 });
+
+  assert.equal(hint.key, "realtime.hint.warmingUp");
+});
+
+test("麦克风静音要盖过门控跳过的说法——跳过是结果，静音才是原因", () => {
+  const hint = pipelineHint({
+    sending: true, hasStatus: true, gatedWindows: 4, framesSent: 40, peakLevel: 0,
+  });
+
+  assert.equal(hint.key, "realtime.hint.micSilent");
+});
+
+test("有声音、跑过窗口、但还没稳定内容时，仍然说是还在等", () => {
+  const hint = pipelineHint({ sending: true, hasStatus: true, framesSent: 90, peakLevel: 0.3 });
+
+  assert.equal(hint.key, "realtime.hint.waiting");
+});

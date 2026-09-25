@@ -118,6 +118,9 @@ button.source.muted { opacity: 0.5; text-decoration: line-through; }
 }
 
 .meta { font-size: 12px; color: var(--muted); }
+
+/* 麦克风在送数字静音时把这行标红：这是「说话了却什么都没出来」最常见的原因。 */
+.mic-info[data-silent='yes'] { color: var(--coral); font-weight: 620; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 
 .notice {

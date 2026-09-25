@@ -47,6 +47,10 @@ const state = {
   failures: 0,
   degraded: false,
   stickyNotice: false,
+  framesSent: 0,
+  peakLevel: 0,
+  micInfo: null,
+  micSilent: false,
 };
 
 const dom = {};
@@ -55,7 +59,7 @@ function cacheDom() {
   const ids = [
     "runtime", "localeSelect", "sessionName", "statePill", "sessionId",
     "startButton", "pauseButton", "stopButton",
-    "micButton", "micMeter", "systemButton", "systemMeter",
+    "micButton", "micMeter", "systemButton", "systemMeter", "micInfo",
     "statRtf", "statLag", "statGated", "statDropped", "statClock",
     "committedList", "committedEmpty", "provisionalList", "provisionalEmpty",
     "exportBar", "retranscribeButton", "historyButton", "historyPanel", "historyList",
@@ -138,6 +142,8 @@ function renderCommitted() {
       gatedWindows: state.lastStatus ? state.lastStatus.gated_windows : 0,
       degraded: state.degraded,
       failures: state.failures,
+      framesSent: state.framesSent,
+      peakLevel: state.peakLevel,
     });
     dom.committedEmpty.textContent = hint
       ? t(hint.key, hint.params)
@@ -324,7 +330,44 @@ function sendFrame(pcm) {
     renderStats();
     return;
   }
+  // 量的是**真正发出去的这批样本**的峰值。麦克风"拿到了但送的是数字静音"（系统层禁麦、
+  // 选错设备）在 getUserMedia 那一步是完全成功的，只有看样本才能发现。取衰减最大值，
+  // 界面上才是一条能看的电平，而不是每帧乱跳的数字。
+  let peak = 0;
+  for (let i = 0; i < pcm.length; i += 1) {
+    const value = pcm[i] < 0 ? -pcm[i] : pcm[i];
+    if (value > peak) peak = value;
+  }
+  state.framesSent += 1;
+  state.peakLevel = Math.max(peak, state.peakLevel * 0.85);
   state.socket.send(pcm.buffer.slice(pcm.byteOffset, pcm.byteOffset + pcm.byteLength));
+}
+
+/** 顶栏那行麦克风信息：哪台设备、什么参数、以及**现在有没有在送声音**。 */
+function renderMicInfo() {
+  if (!dom.micInfo) return;
+  const info = state.micInfo;
+  if (!info) {
+    dom.micInfo.textContent = "";
+    return;
+  }
+  const seconds = (state.framesSent / 10).toFixed(0);
+  const level = Math.min(100, Math.round(state.peakLevel * 400));
+  dom.micInfo.textContent = t("realtime.mic.info", {
+    label: info.label || t("realtime.mic.unknown"),
+    rate: info.rate || "?",
+    seconds,
+    level,
+  });
+  const silent = state.framesSent >= 20 && state.peakLevel < 1e-4;
+  dom.micInfo.dataset.silent = silent ? "yes" : "no";
+  // "麦克风在送静音"这件事**在第一个窗口跑起来之前**就已经能看出来了，而那时候还没有
+  // 任何服务端事件、也就没有任何东西会触发重画——空态提示会一直停在"正在攒第一个窗口"。
+  // 所以状态一变就自己重画一次。
+  if (silent !== state.micSilent) {
+    state.micSilent = silent;
+    renderCommitted();
+  }
 }
 
 // ---------------------------------------------------------------- 音频采集
@@ -423,7 +466,9 @@ async function enableMicrophone() {
       audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
     });
   } catch (err) {
-    notice("realtime.notice.noMic");
+    // 把浏览器的原始原因带上：过约束（某台设备的 AEC/NS/AGC 开关组合它不支持）、设备被
+    // 别的程序独占、权限被拒——都不是同一件事，只报"拿不到权限"会把人引到错的方向。
+    notice("realtime.notice.noMic", { detail: `${err.name || "Error"}: ${err.message || err}` });
     return;
   }
   const source = audio.context.createMediaStreamSource(stream);
@@ -431,7 +476,14 @@ async function enableMicrophone() {
   gain.gain.value = 1;
   source.connect(gain).connect(audio.master);
   audio.sources.set("mic", { stream, source, gain });
-  attachMeter(stream.getAudioTracks()[0], dom.micMeter);
+  const track = stream.getAudioTracks()[0];
+  const settings = (track && track.getSettings) ? track.getSettings() : {};
+  state.micInfo = {
+    label: track ? track.label : "",
+    rate: settings.sampleRate || audio.context.sampleRate,
+  };
+  renderMicInfo();
+  attachMeter(track, dom.micMeter);
   dom.micButton?.classList.add("active");
 }
 
@@ -524,6 +576,9 @@ async function start() {
   state.hasStatus = false;
   state.failures = 0;
   state.degraded = false;
+  state.framesSent = 0;
+  state.peakLevel = 0;
+  state.micSilent = false;
   state.follow = true;
   clearStickyNotice();
   renderCommitted();
@@ -546,8 +601,10 @@ async function start() {
     dom.stopButton.disabled = false;
   });
   state.clockTimer = window.setInterval(() => {
-    if (!dom.statClock) return;
-    dom.statClock.textContent = formatClock((Date.now() - state.startedAt) / 1000);
+    if (dom.statClock) {
+      dom.statClock.textContent = formatClock((Date.now() - state.startedAt) / 1000);
+    }
+    renderMicInfo();          // 电平要跟着走，否则"麦克风在不在送声音"看不出来
   }, 500);
 }
 
