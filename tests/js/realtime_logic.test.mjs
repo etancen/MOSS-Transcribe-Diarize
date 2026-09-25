@@ -13,6 +13,7 @@ import {
   segmentsForSpeaker,
   shouldFollow,
   speakerColor,
+  statusAlert,
 } from "../../moss_transcribe_diarize/app/static/realtime_logic.js";
 
 test("formatClock 按需要决定要不要带小时", () => {
@@ -138,4 +139,30 @@ test("有声音、跑过窗口、但还没稳定内容时，仍然说是还在�
   const hint = pipelineHint({ sending: true, hasStatus: true, framesSent: 90, peakLevel: 0.3 });
 
   assert.equal(hint.key, "realtime.hint.waiting");
+});
+
+test("后端连续失败时挂降级告警，并用故障色", () => {
+  assert.deepEqual(statusAlert({ degraded: true }), {
+    key: "realtime.notice.degraded",
+    tone: "bad",
+  });
+});
+
+test("跟得上但算力吃紧时挂算力告警——是提醒，不是故障色", () => {
+  assert.deepEqual(statusAlert({ overloaded: true }), {
+    key: "realtime.notice.overloaded",
+    tone: "warn",
+  });
+});
+
+test("降级要盖过算力吃紧：后端都失败了，跟不上只是它的结果", () => {
+  const alert = statusAlert({ degraded: true, overloaded: true });
+
+  assert.equal(alert.key, "realtime.notice.degraded");
+  assert.equal(alert.tone, "bad");
+});
+
+test("恢复正常时没有告警，粘性提示才收得掉", () => {
+  assert.equal(statusAlert({ degraded: false, overloaded: false }), null);
+  assert.equal(statusAlert(), null, "老后端不发 overloaded 时不能被当成告警");
 });

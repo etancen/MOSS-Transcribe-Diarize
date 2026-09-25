@@ -15,6 +15,7 @@ import {
   shouldFollow,
   speakerColor,
   speakerIndex,
+  statusAlert,
 } from "./realtime_logic.js";
 
 const WS_PATH = "/ws/realtime";
@@ -263,7 +264,10 @@ function renderStats() {
   if (dom.statLag) dom.statLag.textContent = status ? `${status.lag_sec.toFixed(1)}s` : "—";
   if (dom.statGated) dom.statGated.textContent = status ? String(status.gated_windows) : "0";
   if (dom.statDropped) dom.statDropped.textContent = String(state.droppedFrames);
-  if (dom.statLag && status && status.degraded) dom.statLag.dataset.tone = "bad";
+  // 积压数字的颜色分两档：后端失败是故障（红），算力跟不上只是提醒（琥珀）——
+  // 两者都让这个数变红的话，用户分不出"要去看日志"还是"等它追上来"。
+  const alert = statusAlert(status || {});
+  if (dom.statLag && alert) dom.statLag.dataset.tone = alert.tone;
   else if (dom.statLag) delete dom.statLag.dataset.tone;
 }
 
@@ -294,16 +298,19 @@ function handleEvent(event) {
       }
       renderCommitted();
       break;
-    case "status":
+    case "status": {
       state.lastStatus = event;
       state.hasStatus = true;
       state.degraded = Boolean(event.degraded);
       if (!state.degraded) state.failures = 0;
-      if (state.degraded) notice("realtime.notice.degraded", {}, { sticky: true });
+      const alert = statusAlert(event);
+      // 积压秒数一起报出去：只说"算力跟不上"用户没法判断是刚发生还是已经积了很久。
+      if (alert) notice(alert.key, { lag: event.lag_sec }, { sticky: true });
       else clearStickyNotice();
       renderStats();
       renderCommitted();                 // 空态的解释要跟着门控计数一起更新
       break;
+    }
     case "error":
       state.failures = Number(event.failures) || state.failures + 1;
       // 故障不留 8 秒就消失：用户回来时告警已经没了，屏幕上只剩空白。

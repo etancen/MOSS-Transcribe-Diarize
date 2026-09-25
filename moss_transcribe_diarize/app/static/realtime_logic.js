@@ -119,3 +119,23 @@ export function pipelineHint({
   if (gatedWindows > 0) return { key: "realtime.hint.silentWindows", params: { count: gatedWindows } };
   return { key: "realtime.hint.waiting", params: {} };
 }
+
+/**
+ * 一条 status 该不该挂告警、挂哪一条、顶栏那个积压数字该是什么颜色。
+ *
+ * 后端已经算好了 `overloaded`（落后超过 `3 * W`，spec §4.7）。它和 `degraded` 的区别是
+ * **还在出内容、只是追不上**：所以它用提醒色而不是故障色——用户据此才知道该等着，还是
+ * 该去看看后端。这不是空态提示（那个由 `pipelineHint` 负责）：算力吃紧时屏幕上往往是
+ * 一堆旧内容，而不是空白。
+ *
+ * 两条同时成立时只报降级：后端连续失败时落后必然跟着涨，`overloaded` 只是它的结果，
+ * 一起说出来会把真正要看的那条稀释掉。
+ *
+ * 返回 `null` 表示"没有告警"。调用方正是靠这个 `null` 把粘性提示收掉，所以健康时不能
+ * 返回一个空对象。
+ */
+export function statusAlert({ degraded = false, overloaded = false } = {}) {
+  if (degraded) return { key: "realtime.notice.degraded", tone: "bad" };
+  if (overloaded) return { key: "realtime.notice.overloaded", tone: "warn" };
+  return null;
+}

@@ -162,6 +162,7 @@
   "realtime.hint.silentWindows": "{count} windows were skipped as silence: almost no audio in them was above the silence threshold. Check the microphone selection and mute state, or whether system audio is connected at all.",
   "realtime.hint.degraded": "The transcription backend has failed {count} times in a row and is retrying. See the red banner below and the service log.",
   "realtime.notice.degraded": "The transcription backend keeps failing and is retrying — no new text until it recovers.",
+  "realtime.notice.overloaded": "Transcription is {lag}s behind real time and is still catching up: text keeps arriving, but late. If this holds, the backend needs more compute.",
   "realtime.mic.info": "Microphone: {label} · {rate} Hz · {seconds}s sent · level {level}%",
   "realtime.mic.unknown": "unknown device",
   "realtime.hint.micSilent": "The microphone is sending nothing but zeros: the device opened, but every frame is silent. This is what an OS-level microphone permission (Windows Settings -> Privacy -> Microphone), the wrong input device, or an unplugged headset looks like. Switch device or fix the permission, then start again.",

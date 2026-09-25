@@ -69,6 +69,7 @@ button.ghost { background: transparent; }
 .stat { display: flex; align-items: baseline; gap: 5px; }
 .stat b { color: var(--text); font-variant-numeric: tabular-nums; }
 .stat b[data-tone="bad"] { color: var(--coral); }
+.stat b[data-tone="warn"] { color: var(--amber); }
 
 .pill {
   font-size: 12px;
