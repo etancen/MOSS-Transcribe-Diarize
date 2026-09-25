@@ -971,6 +971,66 @@ class PublicControlSurfaceTest(unittest.TestCase):
 
         self.assertEqual(updated.speaker_name, "张总")
 
+class OverloadedStatusTest(unittest.TestCase):
+    """spec §4.7：落后超过 `3 * W` 就要报告积压，前端据此提示"算力跟不上"。
+
+    只报 `lag_sec` 是不够的——那个数在正常稳态下也有 `tail + hop` 那么大（默认约 11 秒），
+    用户没法从它看出"这是正常的"还是"算力跟不上了"。所以服务端要把判断做完。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.runs = Path(self._tmp.name) / "runs"
+
+    def _status(self, session, events):
+        return [event for event in events if event["type"] == "status"][-1]
+
+    def _run(self, session):
+        return asyncio.run(session.run_pending())
+
+    def test_a_healthy_session_is_not_reported_overloaded(self):
+        # 8 秒音频、全定稿：落后 = 8 - 2 = 6 秒，远低于 3 * 20
+        session = RealtimeSession(
+            _config(),
+            transcriber=ScriptedTranscriber(["[1][S01]a[2]"] * 4),
+            store=SessionStore(self.runs, "s1"),
+        )
+        session.push_audio(_speech(8.0))
+
+        status = self._status(session, self._run(session))
+
+        self.assertFalse(status["overloaded"])
+        self.assertLess(status["lag_sec"], 3 * 20.0)
+
+    def test_a_session_far_behind_is_reported_overloaded(self):
+        # 70 秒音频、一段都没定稿：落后 70 秒 > 3 * 20
+        session = RealtimeSession(
+            _config(max_consecutive_failures=9),
+            transcriber=ScriptedTranscriber([""] * 20),
+            store=SessionStore(self.runs, "s2"),
+        )
+        session.push_audio(_speech(70.0))
+
+        status = self._status(session, self._run(session))
+
+        self.assertTrue(status["overloaded"])
+        self.assertGreater(status["lag_sec"], 3 * 20.0)
+
+    def test_the_threshold_follows_the_configured_window(self):
+        # 同一个 40 秒落后：window=20 时不算（3*20=60），window=10 时算（3*10=30）
+        session = RealtimeSession(
+            _config(window=10.0, hop=2.5, min_first_window=4.0),
+            transcriber=ScriptedTranscriber([""] * 20),
+            store=SessionStore(self.runs, "s3"),
+        )
+        session.push_audio(_speech(40.0))
+
+        status = self._status(session, self._run(session))
+
+        self.assertTrue(status["overloaded"])
+
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -432,6 +432,10 @@ class RealtimeSession:
         # 定稿水位线才是用户真正感受到的延迟，它天然包含 window + tail 的开销。
         lag = max(0.0, buffered - self._stitcher.committed_until)
         degraded = self._failures >= self.config.max_consecutive_failures
+        # 稳态下 lag 天然有 tail + hop 那么大，用户没法从它区分"这是正常的"与"算力跟不上"，
+        # 所以判断在服务端做完：落后超过 3 个 window 才算真的跟不上（spec §4.7）。
+        # 用 W 而不是固定秒数，是因为 W 越大单次推理越久，可容忍的落后也越多。
+        overloaded = lag > 3 * self.config.window
         return {
             "type": "status",
             "state": "degraded" if degraded else "running",
@@ -440,6 +444,7 @@ class RealtimeSession:
             "last_window_ms": int(round(self._last_window_sec * 1000)),
             "lag_sec": round(lag, 2),
             "degraded": degraded,
+            "overloaded": overloaded,
             # 静音门控跳过过多少：这是"被跳过"唯一的对外可见之处（状态仍是 running），
             # 否则一个持续把语音误判成静音的会话与健康会话在事件上完全一样。
             "gated_windows": self._gated_windows,
