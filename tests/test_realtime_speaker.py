@@ -25,12 +25,13 @@ class FakeEmbedder:
         return self.mapping.get(key, self.default)
 
 
-def _voice(value: float, *, samples: int = 8000) -> np.ndarray:
-    """一段足够长的假音频，用填充值区分身份。
+def _voice(value: float, *, samples: int = 16000) -> np.ndarray:
+    """一段**可信赖长度**的假音频，用填充值区分身份。
 
-    长度必须超过 SpeakerGallery 的 min_segment_sec 门槛（默认 0.4 秒 = 6400 样本），
-    否则每个分组都拿不到嵌入，测试会静默退化成"未知说话人"而看不出为什么。
-    想测试"太短所以拿不到嵌入"的场景，就显式传一个小的 samples。
+    长度必须同时超过两个门槛：``min_segment_sec``（默认 0.4 秒 = 6400 样本，低于它连
+    嵌入都不算）与 ``min_reliable_sec``（默认 1.0 秒 = 16000 样本，低于它算出的向量是
+    噪声，不许开新身份）。默认给 1.0 秒，让"匹配/开新身份"这些测试跑在可信区间里。
+    想测"太短"的两种分支，就显式传小 `samples` 或给 gallery 传小 `min_reliable_sec`。
     """
     return np.full(samples, value, dtype=np.float32)
 
@@ -105,6 +106,9 @@ class SpeakerGalleryTest(unittest.TestCase):
         gallery = SpeakerGallery(
             FakeEmbedder({long_voice.tobytes(): [1.0, 0.0, 0.0]}, default=None),
             min_segment_sec=0.1,
+            # 这条测试钉的是"组代表怎么选"，不是"多长才算可信"，所以把可靠门槛一起压低，
+            # 让 2000/1700 样本这种长度仍然走"开新身份"那条路。
+            min_reliable_sec=0.01,
         )
 
         def audio_of(seg):
@@ -201,11 +205,64 @@ class SpeakerGalleryTest(unittest.TestCase):
         self.assertEqual(len(roster), 1)
         self.assertEqual(roster[0]["samples"], 5)
 
+    def test_a_short_unmatched_clip_does_not_mint_a_speaker(self):
+        """半秒的短句匹配不上时，不许凭空造一个新说话人。
+
+        真机上量到过：同一个真人在 127 秒里被拆成 S01–S04——"哈喽。"（0.50 秒）成了 S02、
+        "Hello?"（0.72 秒）成了 S03、"呃。"（0.46 秒）成了 S04，全标着 confident。那几段
+        与主说话人质心的相似度只有 0.18–0.48，彼此之间也只有 0.17–0.50：向量是噪声。
+        """
+        known = _voice(1.0)
+        short_unknown = _voice(2.0, samples=8000)  # 0.5 秒，低于可靠门槛
+        gallery = SpeakerGallery(
+            FakeEmbedder(
+                {known.tobytes(): [1.0, 0.0, 0.0], short_unknown.tobytes(): [0.0, 1.0, 0.0]}
+            )
+        )
+        gallery.assign([_seg(0.0, 1.0, "S01", 0)], lambda seg: known)
+
+        assignments = gallery.assign([_seg(20.0, 20.5, "S01", 1)], lambda seg: short_unknown)
+
+        self.assertEqual(assignments[0].speaker_id, "S01", "归到最近的那个已有说话人")
+        self.assertFalse(assignments[0].confident, "短句的判定不可信，必须如实标注")
+        self.assertEqual([item["id"] for item in gallery.speakers()], ["S01"])
+        # 关键：噪声没有进质心。进了的话它会把后面真正属于 S01 的语音全推开，而那一步
+        # 是这套系统里最难恢复的。
+        self.assertEqual(gallery.speakers()[0]["samples"], 1)
+
+    def test_a_short_first_clip_does_not_establish_a_speaker(self):
+        """空库里的第一句如果只有半秒，就报"未知"，而不是拿噪声立一个 S01。
+
+        立了 S01 就等于把那条噪声向量设成全库参照：后面所有真正的语音都会因为与它不像
+        而不断开新身份——这正是真机上"一个真人四个身份"的起点。
+        """
+        short = _voice(1.0, samples=8000)
+        gallery = SpeakerGallery(FakeEmbedder({short.tobytes(): [1.0, 0.0, 0.0]}))
+
+        assignments = gallery.assign([_seg(0.0, 0.5, "S01", 0)], lambda seg: short)
+
+        self.assertEqual(assignments[0].speaker_id, UNKNOWN_SPEAKER_ID)
+        self.assertFalse(assignments[0].confident)
+        self.assertEqual([item["id"] for item in gallery.speakers()], [UNKNOWN_SPEAKER_ID])
+
+    def test_a_long_clip_still_mints_a_speaker(self):
+        """门槛只管短句：够长的音频照样能开新身份，别把功能一起关掉。"""
+        first = _voice(1.0)
+        second = _voice(2.0, samples=24000)  # 1.5 秒
+        gallery = SpeakerGallery(
+            FakeEmbedder({first.tobytes(): [1.0, 0.0, 0.0], second.tobytes(): [0.0, 1.0, 0.0]})
+        )
+        gallery.assign([_seg(0.0, 1.0, "S01", 0)], lambda seg: first)
+
+        assignments = gallery.assign([_seg(20.0, 21.5, "S01", 1)], lambda seg: second)
+
+        self.assertEqual(assignments[0].speaker_id, "S02")
+        self.assertTrue(assignments[0].confident)
+
     def test_empty_input_returns_empty(self):
         gallery = SpeakerGallery(None)
 
         self.assertEqual(gallery.assign([], lambda seg: None), [])
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -116,10 +116,11 @@ class RealtimeSession:
         self._last_executed_end = 0.0
         self._gated_windows = 0
         self._gated_sec = 0.0
-        # 被门控跳过的窗口里，**最靠后**的那个的末尾。门控跳过的音频没有内容可提交，
-        # 定稿水位线永远推不过它，所以它是"这段落后其实没人说话"的证据。判积压时用它
-        # 把静音从 lag 里扣掉（见 _status_event）。
-        self._gated_until = 0.0
+        # 被判定为静音、**且不会再产出内容**的音频推进到哪：门控跳过的窗口，以及被覆盖
+        # 规则逼着执行、但执行出来也全是幻觉的静音窗口（见 _process_window）。静音没有
+        # 内容可提交，定稿水位线永远推不过它，所以它是"这段落后其实没人说话"的证据。
+        # 判积压时用它把静音从 lag 里扣掉（见 _status_event）。
+        self._silent_until = 0.0
         self._window_running = False
         self._failures = 0
         self._window_id = 0
@@ -197,7 +198,7 @@ class RealtimeSession:
                 self._last_run_sec = decision.end_sec
                 self._gated_windows += 1
                 self._gated_sec += decision.end_sec - decision.start_sec
-                self._gated_until = max(self._gated_until, decision.end_sec)
+                self._silent_until = max(self._silent_until, decision.end_sec)
                 return [self._status_event()]
         return await self._run_window(start, decision.end_sec, audio)
 
@@ -372,6 +373,20 @@ class RealtimeSession:
         audio: np.ndarray,
     ) -> tuple[list[CommittedSegment], list[Segment]]:
         raw = self._transcriber.transcribe_window(audio, prompt=self._prompt)
+        if self.config.silence_gate and is_silent(
+            audio,
+            self.config.sample_rate,
+            self.config.silence_rms_db,
+            self.config.silence_frame_ratio,
+        ):
+            # 这个窗口是**覆盖性保证**逼着执行的（真正的静音早被门控跳过了），里面没有
+            # 语音可转写。可模型不会说"没有"，它会在纯静音上幻觉出一整段话——实机上量到
+            # 过一段 Qwen 的拒绝话术（"I'm sorry, I can't assist with that request…"）
+            # 被当成 10 秒定稿写进会议纪要，还顺手造了个说话人。既然没有语音，结果就丢掉；
+            # 窗口的覆盖照样算数（`last_executed_end` 由调用方推进，见 run_pending），
+            # 只是它也算"这段没人说话"，积压里要按静音扣掉。
+            raw = ""
+            self._silent_until = max(self._silent_until, end)
         # ingest 会推进水位线并替换临时快照，但内容此时还没落盘（嵌入与追加都在
         # _commit 里）。先记下这两块状态，定稿失败时回滚——否则水位线已经越过这些
         # 段落，下一个窗口会按"已定稿"或"跨水位线"把它们丢掉，内容永久消失，且没有
@@ -442,7 +457,7 @@ class RealtimeSession:
         # 里一段被门控的静音把 lag 顶到 46.2 秒，离 `3 * W` 只差 14 秒；再长一点，一台
         # 完全空闲的 GPU 就会被报成跟不上。`lag_sec` 本身不动：前端显示的是用户真正
         # 感受到的延迟，该涨就得涨。
-        gated_pending = max(0.0, self._gated_until - self._stitcher.committed_until)
+        gated_pending = max(0.0, self._silent_until - self._stitcher.committed_until)
         # 稳态下 lag 天然有 tail + hop 那么大，用户没法从它区分"这是正常的"与"算力跟不上"，
         # 所以判断在服务端做完：落后超过 3 个 window 才算真的跟不上（spec §4.7）。
         # 用 W 而不是固定秒数，是因为 W 越大单次推理越久，可容忍的落后也越多。

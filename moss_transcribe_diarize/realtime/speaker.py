@@ -63,6 +63,13 @@ CAMPLUS_MODELS: dict[str, tuple[str, str]] = {
 }
 
 MIN_EMBED_FRAMES = 10
+
+# 声纹嵌入在一秒以下是**噪声**，不是"较弱但还能用的信号"。实机 127 秒录音上量过：长段
+# （1.3–4.2 秒）与同一个人的质心相似度 0.82–0.92，而 0.5 秒的"哈喽。"只有 0.36，几个
+# 短句彼此之间也只有 0.17–0.50——它们不携带身份信息，任何基于它们的判定都是掷骰子。
+# 拿噪声开新身份还是**不可逆**的：那条噪声向量会成为质心，把后面所有真正的语音都推开，
+# 于是一个真人被拆成 4 个说话人。所以短片段不许开新身份、也不更新质心。
+RELIABLE_EMBED_SEC = 1.0
 EMBED_FBANK_BINS = 80
 
 
@@ -209,12 +216,14 @@ class SpeakerGallery:
         *,
         threshold: float = 0.55,
         min_segment_sec: float = 0.4,
+        min_reliable_sec: float = RELIABLE_EMBED_SEC,
         sample_rate: int = 16000,
     ):
         self._embedder = embedder
         self._threshold = float(threshold)
         self._sample_rate = int(sample_rate)
         self._min_samples = max(1, int(round(min_segment_sec * self._sample_rate)))
+        self._reliable_samples = max(1, int(round(min_reliable_sec * self._sample_rate)))
         self._entries: dict[str, _GalleryEntry] = {}
         self._next_index = 1
         self._unknown_assignments = 0
@@ -276,9 +285,9 @@ class SpeakerGallery:
             self._unknown_assignments += 1
             return UNKNOWN_SPEAKER_ID, False
 
-        return self._match(embedding), True
+        return self._match(embedding, samples=best_size)
 
-    def _match(self, embedding: np.ndarray) -> str:
+    def _match(self, embedding: np.ndarray, *, samples: int) -> tuple[str, bool]:
         vec = _normalize(embedding)
         best_id: str | None = None
         best_score = -1.0
@@ -291,12 +300,21 @@ class SpeakerGallery:
             entry = self._entries[best_id]
             entry.centroid = _normalize(entry.centroid * entry.samples + vec)
             entry.samples += 1
-            return best_id
+            return best_id, True
 
-        new_id = f"S{self._next_index:02d}"
-        self._next_index += 1
-        self._entries[new_id] = _GalleryEntry(id=new_id, centroid=vec, samples=1)
-        return new_id
+        if samples >= self._reliable_samples:
+            new_id = f"S{self._next_index:02d}"
+            self._next_index += 1
+            self._entries[new_id] = _GalleryEntry(id=new_id, centroid=vec, samples=1)
+            return new_id, True
+
+        # 太短、又匹配不上：这段音频的向量是噪声，判定不可信（见 RELIABLE_EMBED_SEC）。
+        # 有已有说话人就归到最近的那个，但**不更新质心**——噪声进质心会把后面真正属于
+        # 那个人的语音全都推开，那是这个 bug 里最难恢复的一步。没有就报"未知"。
+        if best_id is not None:
+            return best_id, False
+        self._unknown_assignments += 1
+        return UNKNOWN_SPEAKER_ID, False
 
     def rename(self, speaker_id: str, name: str) -> None:
         entry = self._entries.get(speaker_id)

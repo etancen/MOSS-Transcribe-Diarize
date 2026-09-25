@@ -1079,6 +1079,35 @@ class OverloadedStatusTest(unittest.TestCase):
         self.assertGreater(status["lag_sec"], 3 * 20.0)
         self.assertTrue(status["overloaded"], "静音之后还积压着大量语音，这才是算力跟不上")
 
+    def test_a_window_of_digital_silence_commits_nothing(self):
+        """覆盖性保证会逼出静音窗，而模型会在纯静音上幻觉出一整段话。
+
+        真机上量到过：一段 `rms`/`peak` 全为 0 的窗口产出了 "I'm sorry, I can't assist
+        with that request…（Qwen 的拒绝话术）" 并被当成 10 秒定稿写进会议纪要，还顺手造了
+        一个说话人。没有语音就没有内容可提交——不管模型多自信地说了什么。
+        """
+        session = RealtimeSession(
+            _config(silence_gate=True),
+            transcriber=ScriptedTranscriber(
+                ["[1][S01]I'm sorry, I can't assist with that request.[2]"] * 30
+            ),
+            store=SessionStore(self.runs, "s6"),
+        )
+
+        events = self._drive(session, ("silence", 40.0))
+
+        statuses = [event for event in events if event["type"] == "status"]
+        self.assertEqual(
+            [event for event in events if event["type"] == "committed"], [], "静音窗不该有任何定稿"
+        )
+        # 确认这一轮真的动过（覆盖规则逼出的执行 + 门控跳过），否则这条测试可能只是
+        # "什么都没跑"就通过了。
+        self.assertGreater(
+            statuses[-1]["gated_windows"] + statuses[-1]["last_window_ms"], 0
+        )
+        # 静音的落后不算积压：与门控窗走同一套扣除。
+        self.assertFalse(statuses[-1]["overloaded"])
+
 
 
 if __name__ == "__main__":
