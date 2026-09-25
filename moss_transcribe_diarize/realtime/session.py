@@ -116,6 +116,10 @@ class RealtimeSession:
         self._last_executed_end = 0.0
         self._gated_windows = 0
         self._gated_sec = 0.0
+        # 被门控跳过的窗口里，**最靠后**的那个的末尾。门控跳过的音频没有内容可提交，
+        # 定稿水位线永远推不过它，所以它是"这段落后其实没人说话"的证据。判积压时用它
+        # 把静音从 lag 里扣掉（见 _status_event）。
+        self._gated_until = 0.0
         self._window_running = False
         self._failures = 0
         self._window_id = 0
@@ -193,6 +197,7 @@ class RealtimeSession:
                 self._last_run_sec = decision.end_sec
                 self._gated_windows += 1
                 self._gated_sec += decision.end_sec - decision.start_sec
+                self._gated_until = max(self._gated_until, decision.end_sec)
                 return [self._status_event()]
         return await self._run_window(start, decision.end_sec, audio)
 
@@ -432,10 +437,16 @@ class RealtimeSession:
         # 定稿水位线才是用户真正感受到的延迟，它天然包含 window + tail 的开销。
         lag = max(0.0, buffered - self._stitcher.committed_until)
         degraded = self._failures >= self.config.max_consecutive_failures
+        # 积压要扣掉"被门控跳过的静音"：那段音频没有内容可提交，水位线本来就推不动，
+        # 把它算成落后会把"没人说话"报成"算力跟不上"。真机上量到过——127 秒的真实录音
+        # 里一段被门控的静音把 lag 顶到 46.2 秒，离 `3 * W` 只差 14 秒；再长一点，一台
+        # 完全空闲的 GPU 就会被报成跟不上。`lag_sec` 本身不动：前端显示的是用户真正
+        # 感受到的延迟，该涨就得涨。
+        gated_pending = max(0.0, self._gated_until - self._stitcher.committed_until)
         # 稳态下 lag 天然有 tail + hop 那么大，用户没法从它区分"这是正常的"与"算力跟不上"，
         # 所以判断在服务端做完：落后超过 3 个 window 才算真的跟不上（spec §4.7）。
         # 用 W 而不是固定秒数，是因为 W 越大单次推理越久，可容忍的落后也越多。
-        overloaded = lag > 3 * self.config.window
+        overloaded = lag - gated_pending > 3 * self.config.window
         return {
             "type": "status",
             "state": "degraded" if degraded else "running",

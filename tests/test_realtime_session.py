@@ -989,6 +989,23 @@ class OverloadedStatusTest(unittest.TestCase):
     def _run(self, session):
         return asyncio.run(session.run_pending())
 
+    def _drive(self, session, *spans, chunk: float = 5.0):
+        """按 `chunk` 秒一小块喂音频，每块之后轮询一次——真实 driver 就是这个节奏。
+
+        不能一次性 `push_audio(70 秒)`：窗口策略取的是"当前能取的最新窗口"，一次灌完
+        只会得到**一个**覆盖整个缓冲的大窗口，"距上次执行攒够 window - hop"这条门控
+        条件永远不成立，测出来的东西和真机行为不是一回事。
+        """
+        events = []
+        for kind, seconds in spans:
+            remaining = seconds
+            while remaining > 1e-9:
+                step = min(chunk, remaining)
+                session.push_audio(_silence(step) if kind == "silence" else _speech(step))
+                events.extend(self._run(session))
+                remaining -= step
+        return events
+
     def test_a_healthy_session_is_not_reported_overloaded(self):
         # 8 秒音频、全定稿：落后 = 8 - 2 = 6 秒，远低于 3 * 20
         session = RealtimeSession(
@@ -1029,6 +1046,38 @@ class OverloadedStatusTest(unittest.TestCase):
         status = self._status(session, self._run(session))
 
         self.assertTrue(status["overloaded"])
+
+    def test_a_long_silence_is_not_reported_overloaded(self):
+        """静音不是积压：没人说话时没有内容可提交，定稿水位线本来就推不动。
+
+        真机上量到过这个假阳性——一次 127 秒的真实录音里有一段被门控的静音，`lag` 一路
+        涨到 46.2 秒，离 `3 * 20` 只差 14 秒。再长一点，一台**完全空闲**的 GPU 就会被报成
+        "算力跟不上"。所以判断积压时要把这段扣掉；`lag_sec` 本身不动，前端显示的是用户
+        真正感受到的延迟，那个数该涨就得涨。
+        """
+        session = RealtimeSession(
+            _config(silence_gate=True),
+            transcriber=ScriptedTranscriber([""] * 20),
+            store=SessionStore(self.runs, "s4"),
+        )
+        status = self._status(session, self._drive(session, ("silence", 70.0)))
+
+        self.assertGreater(status["gated_windows"], 0, "这段音频本来就该被门控跳过")
+        self.assertGreater(status["lag_sec"], 3 * 20.0, "lag 确实越过了阈值——这正是要区分开的那件事")
+        self.assertFalse(status["overloaded"], "没人说话不等于算力跟不上")
+
+    def test_a_gated_silence_does_not_hide_a_real_backlog(self):
+        """扣掉静音不能顺手把真正的积压也扣掉：静音之后还压着 80 秒语音，必须报。"""
+        session = RealtimeSession(
+            _config(silence_gate=True),
+            transcriber=ScriptedTranscriber([""] * 40),
+            store=SessionStore(self.runs, "s5"),
+        )
+        status = self._status(session, self._drive(session, ("silence", 40.0), ("speech", 80.0)))
+
+        self.assertGreater(status["gated_windows"], 0)
+        self.assertGreater(status["lag_sec"], 3 * 20.0)
+        self.assertTrue(status["overloaded"], "静音之后还积压着大量语音，这才是算力跟不上")
 
 
 
